@@ -20,7 +20,8 @@ def parse_args() -> argparse.Namespace:
             "captures, and moves discarded files."
         )
     )
-    parser.add_argument("directory", type=Path, help="Directory containing photos")
+    parser.add_argument("directory", nargs="?", type=Path, help="Directory containing photos")
+    parser.add_argument("--gui", action="store_true", help="Launch the GUI prototype")
     parser.add_argument("--recursive", action="store_true", help="Scan recursively")
     parser.add_argument("--time-threshold", type=int, default=None, help="Seconds between shots")
     parser.add_argument("--hash-threshold", type=int, default=None, help="Hamming distance")
@@ -47,15 +48,30 @@ def main() -> None:
         duplicate_directory=args.duplicate_dir or settings.duplicate_directory,
     )
 
-    logger.info("Scanning %s (recursive=%s)", args.directory, effective.scan_recursive)
-    photos = scan_directory(args.directory, recursive=effective.scan_recursive)
+    if args.gui:
+        from ui.app import run_gui
+
+        run_gui(effective, args.directory)
+        save_settings(effective)
+        return
+
+    if not args.directory:
+        raise SystemExit("Please provide a directory or launch with --gui to open the interface.")
+
+    run_cli(args, effective)
+    save_settings(effective)
+
+
+def run_cli(args: argparse.Namespace, settings: Settings) -> None:
+    logger.info("Scanning %s (recursive=%s)", args.directory, settings.scan_recursive)
+    photos = scan_directory(args.directory, recursive=settings.scan_recursive)
     logger.info("Found %s photos", len(photos))
 
     groups = group_bursts(
         photos,
-        time_threshold_seconds=effective.time_threshold_seconds,
-        hash_threshold=effective.hash_threshold,
-        min_group_size=effective.min_group_size,
+        time_threshold_seconds=settings.time_threshold_seconds,
+        hash_threshold=settings.hash_threshold,
+        min_group_size=settings.min_group_size,
     )
 
     for group in groups:
@@ -71,14 +87,12 @@ def main() -> None:
 
     logger.info("Keeping %s photos, discarding %s", len(kept), len(discarded))
 
-    duplicate_dir = args.directory / effective.duplicate_directory
+    duplicate_dir = args.directory / settings.duplicate_directory
     moved = move_photos(discarded, duplicate_dir, dry_run=args.dry_run)
     if args.dry_run:
         logger.info("[dry-run] Would move %s files to %s", moved, duplicate_dir)
     else:
         logger.info("Moved %s files to %s", moved, duplicate_dir)
-
-    save_settings(effective)
 
 
 if __name__ == "__main__":

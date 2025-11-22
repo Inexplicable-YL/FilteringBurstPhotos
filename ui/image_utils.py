@@ -1,0 +1,28 @@
+from __future__ import annotations
+
+from PIL import Image
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QImage, QPixmap
+
+
+def pil_to_qpixmap(image: Image.Image) -> QPixmap:
+    """Convert a Pillow image to a Qt pixmap."""
+
+    prepared = _ensure_rgba(image)
+    data = prepared.tobytes("raw", "RGBA")
+    qimage = QImage(data, prepared.width, prepared.height, QImage.Format_RGBA8888)
+    return QPixmap.fromImage(qimage)
+
+
+def scale_pixmap(pixmap: QPixmap, max_size: int) -> QPixmap:
+    """Return a scaled pixmap preserving aspect ratio."""
+
+    if pixmap.isNull():
+        return pixmap
+    return pixmap.scaled(max_size, max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+
+def _ensure_rgba(image: Image.Image) -> Image.Image:
+    if image.mode != "RGBA":
+        return image.convert("RGBA")
+    return image

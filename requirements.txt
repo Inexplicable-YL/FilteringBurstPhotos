@@ -2,3 +2,4 @@ pillow
 imagehash
 rawpy
 numpy
+PySide6
