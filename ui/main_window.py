@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
+import anyio
 from PIL import UnidentifiedImageError
-from PySide6.QtCore import QPoint, QEvent, QRect, QSize, Qt
+from PySide6.QtCore import QPoint, QEvent, QRect, QSize, Qt, Signal, QObject
 from PySide6.QtGui import QAction, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -40,6 +42,45 @@ THUMBNAIL_MAX_SIZE = 220
 INITIAL_THUMBNAIL_SIZE = 140
 
 
+class ScanWorker(QObject):
+    """Background scanner using anyio threads to keep UI responsive."""
+
+    finished = Signal(list, list)
+    failed = Signal(str)
+
+    def __init__(self, directory: Path, settings: Settings) -> None:
+        super().__init__()
+        self.directory = directory
+        self.settings = settings
+
+    def start(self) -> None:
+        thread = threading.Thread(target=self._run, daemon=True)
+        thread.start()
+
+    def _run(self) -> None:
+        try:
+            photos, groups = anyio.run(self._scan_and_group)
+            self.finished.emit(photos, groups)
+        except Exception as exc:  # pragma: no cover - background thread safety
+            logger.exception("Failed during scan")
+            self.failed.emit(str(exc))
+
+    async def _scan_and_group(self) -> tuple[List[Photo], List[Group]]:
+        photos = await anyio.to_thread.run_sync(
+            scan_directory,
+            self.directory,
+            recursive=self.settings.scan_recursive,
+        )
+        groups = await anyio.to_thread.run_sync(
+            group_bursts,
+            photos,
+            time_threshold_seconds=self.settings.time_threshold_seconds,
+            hash_threshold=self.settings.hash_threshold,
+            min_group_size=self.settings.min_group_size,
+        )
+        return photos, groups
+
+
 class MainWindow(QMainWindow):
     """GUI for browsing and filtering burst photos."""
 
@@ -57,6 +98,7 @@ class MainWindow(QMainWindow):
         self.thumbnail_size = INITIAL_THUMBNAIL_SIZE
         self._selected_paths: Set[Path] = set()
         self._group_widgets: List[GroupWidget] = []
+        self._scan_worker: Optional[ScanWorker] = None
 
         self.toolbar = self._build_toolbar()
         self.status_bar = QStatusBar()
@@ -149,26 +191,33 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "未找到目录", f"目录不存在: {directory}")
             return
 
+        if self._scan_worker is not None:
+            self.status_bar.showMessage("正在处理上一个请求，请稍候…", 3000)
+            return
+
         self.status_bar.showMessage(f"扫描中: {directory}")
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            self.photos = scan_directory(directory, recursive=self.settings.scan_recursive)
-            self.groups = group_bursts(
-                self.photos,
-                time_threshold_seconds=self.settings.time_threshold_seconds,
-                hash_threshold=self.settings.hash_threshold,
-                min_group_size=self.settings.min_group_size,
-            )
-            self.current_directory = directory
-            self._populate_groups()
-            self.status_bar.showMessage(
-                f"找到 {len(self.photos)} 张照片，{len(self.groups)} 个连拍组", 5000
-            )
-        except Exception as exc:  # pragma: no cover - UI feedback
-            logger.exception("Failed to scan directory")
-            QMessageBox.critical(self, "扫描失败", str(exc))
-        finally:
-            QApplication.restoreOverrideCursor()
+        self._scan_worker = ScanWorker(directory, self.settings)
+        self._scan_worker.finished.connect(self._on_scan_finished)
+        self._scan_worker.failed.connect(self._on_scan_failed)
+        self._scan_worker.start()
+
+    def _on_scan_finished(self, photos: List[Photo], groups: List[Group]) -> None:
+        QApplication.restoreOverrideCursor()
+        self.photos = photos
+        self.groups = groups
+        self.current_directory = self._scan_worker.directory if self._scan_worker else self.current_directory
+        self._scan_worker = None
+        self._populate_groups()
+        self.status_bar.showMessage(
+            f"找到 {len(self.photos)} 张照片，{len(self.groups)} 个连拍组", 5000
+        )
+
+    def _on_scan_failed(self, error: str) -> None:
+        QApplication.restoreOverrideCursor()
+        self._scan_worker = None
+        logger.error("Scan failed: %s", error)
+        QMessageBox.critical(self, "扫描失败", error)
 
     def _populate_groups(self) -> None:
         self._clear_layout(self.group_layout)
@@ -261,16 +310,15 @@ class MainWindow(QMainWindow):
         new_groups: List[Group] = []
         kept_photos: List[Photo] = []
         for group in self.groups:
-            has_selection = any(photo.path in self._selected_paths for photo in group.photos)
-            if not has_selection:
+            selected_in_group = [photo for photo in group.photos if photo.path in self._selected_paths]
+            if not selected_in_group or len(selected_in_group) == len(group.photos):
                 new_groups.append(group)
                 kept_photos.extend(group.photos)
                 continue
-            filtered = [photo for photo in group.photos if photo.path in self._selected_paths]
-            if filtered:
-                group.photos = filtered
-                new_groups.append(group)
-                kept_photos.extend(filtered)
+
+            group.photos = selected_in_group
+            new_groups.append(group)
+            kept_photos.extend(selected_in_group)
         self.groups = new_groups
         self.photos = kept_photos
         self._populate_groups()
