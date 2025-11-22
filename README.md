@@ -19,6 +19,12 @@ pip install -r requirements.txt
 python main.py <photo_directory> --recursive --dry-run
 ```
 
+Launch the GUI prototype (folder can be chosen later if omitted):
+
+```bash
+python main.py --gui [photo_directory]
+```
+
 Command-line flags:
 
 - `--recursive`: scan subfolders.
