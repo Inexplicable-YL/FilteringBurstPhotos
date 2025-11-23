@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from anyio import to_thread
+
 from .image_hash import hamming_distance
 from .models import Group, Photo
 
@@ -73,3 +75,20 @@ def _grouping_sort_key(photo: Photo) -> tuple[datetime, str]:
     """Stable grouping sort key for photos."""
 
     return (photo.taken_time, photo.path.name)
+
+
+async def group_bursts_async(
+    photos: Sequence[Photo],
+    time_threshold_seconds: int = 3,
+    hash_threshold: int = 5,
+    min_group_size: int = 2,
+) -> list[Group]:
+    """Async wrapper for grouping work using a worker thread."""
+
+    return await to_thread.run_sync(
+        group_bursts,
+        photos,
+        time_threshold_seconds,
+        hash_threshold,
+        min_group_size,
+    )

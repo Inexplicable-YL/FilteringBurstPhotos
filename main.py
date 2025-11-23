@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 from pathlib import Path
 
 from config.settings import Settings, load_settings, save_settings
@@ -20,19 +21,29 @@ def parse_args() -> argparse.Namespace:
             "captures, and moves discarded files."
         )
     )
-    parser.add_argument("directory", nargs="?", type=Path, help="Directory containing photos")
+    parser.add_argument(
+        "directory", nargs="?", type=Path, help="Directory containing photos"
+    )
     parser.add_argument("--gui", action="store_true", help="Launch the GUI prototype")
     parser.add_argument("--recursive", action="store_true", help="Scan recursively")
-    parser.add_argument("--time-threshold", type=int, default=None, help="Seconds between shots")
-    parser.add_argument("--hash-threshold", type=int, default=None, help="Hamming distance")
-    parser.add_argument("--min-group-size", type=int, default=None, help="Minimum burst size")
+    parser.add_argument(
+        "--time-threshold", type=int, default=None, help="Seconds between shots"
+    )
+    parser.add_argument(
+        "--hash-threshold", type=int, default=None, help="Hamming distance"
+    )
+    parser.add_argument(
+        "--min-group-size", type=int, default=None, help="Minimum burst size"
+    )
     parser.add_argument(
         "--duplicate-dir",
         type=str,
         default=None,
         help="Directory name for moved duplicates",
     )
-    parser.add_argument("--dry-run", action="store_true", help="List files without moving")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="List files without moving"
+    )
     return parser.parse_args()
 
 
@@ -56,13 +67,16 @@ def main() -> None:
         return
 
     if not args.directory:
-        raise SystemExit("Please provide a directory or launch with --gui to open the interface.")
+        raise SystemExit(
+            "Please provide a directory or launch with --gui to open the interface."
+        )
 
     run_cli(args, effective)
     save_settings(effective)
 
 
 def run_cli(args: argparse.Namespace, settings: Settings) -> None:
+    t1 = time.time()
     logger.info("Scanning %s (recursive=%s)", args.directory, settings.scan_recursive)
     photos = scan_directory(args.directory, recursive=settings.scan_recursive)
     logger.info("Found %s photos", len(photos))
@@ -93,6 +107,9 @@ def run_cli(args: argparse.Namespace, settings: Settings) -> None:
         logger.info("[dry-run] Would move %s files to %s", moved, duplicate_dir)
     else:
         logger.info("Moved %s files to %s", moved, duplicate_dir)
+
+    t2 = time.time()
+    logger.info("Took %.4f seconds", t2 - t1)
 
 
 if __name__ == "__main__":

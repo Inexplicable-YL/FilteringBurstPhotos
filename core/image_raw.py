@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from anyio import to_thread
 from PIL import Image, UnidentifiedImageError
 
 if TYPE_CHECKING:
@@ -45,6 +46,12 @@ def load_image_for_path(path: Path) -> Image.Image:
         raise
     except Exception as exc:  # pragma: no cover - unexpected runtime errors
         raise UnsupportedImageError(f"Failed to load image {path}: {exc}") from exc
+
+
+async def load_image_for_path_async(path: Path) -> Image.Image:
+    """Asynchronously load an image using anyio threads."""
+
+    return await to_thread.run_sync(load_image_for_path, path)
 
 
 def _load_standard_image(path: Path) -> Image.Image:

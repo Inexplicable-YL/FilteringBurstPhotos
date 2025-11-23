@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+import anyio
+from anyio import to_thread
 from PIL import ExifTags, Image
 
-from .image_hash import compute_phash
-from .image_raw import RAW_EXTENSIONS, load_image_for_path
+from .image_hash import compute_phash_async
+from .image_raw import RAW_EXTENSIONS, load_image_for_path_async
 from .models import Photo
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
     from pathlib import Path
+logger = logging.getLogger(__name__)
 
 
 def _discover_supported_extensions() -> set[str]:
@@ -22,51 +25,61 @@ def _discover_supported_extensions() -> set[str]:
     return pil_extensions | {ext.lower() for ext in RAW_EXTENSIONS}
 
 
-SUPPORTED_EXTENSIONS: Iterable[str] = _discover_supported_extensions()
-
-logger = logging.getLogger(__name__)
-
+SUPPORTED_EXTENSIONS: set[str] = _discover_supported_extensions()
 
 EXIF_DATETIME_KEYS = {k: v for k, v in ExifTags.TAGS.items() if v == "DateTime"}
 
 
 def scan_directory(
-    directory: Path, *, recursive: bool = True, ignore_errors: bool = True
+    directory: Path,
+    recursive: bool = True,
+    ignore_errors: bool = True,
+    max_concurrency: int | None = None,
 ) -> list[Photo]:
-    """Scan a directory for supported image files and return ``Photo`` items.
+    """Synchronous wrapper for :func:`scan_directory_async`."""
 
-    Parameters:
-        directory: Root directory to scan.
-        recursive: Whether to recurse into subdirectories.
-        ignore_errors: When ``True`` (default), files that fail to load or hash
-            are skipped with a warning instead of aborting the scan.
+    return anyio.run(
+        scan_directory_async, directory, recursive, ignore_errors, max_concurrency
+    )
+
+
+async def scan_directory_async(
+    directory: Path,
+    recursive: bool = True,
+    ignore_errors: bool = True,
+    max_concurrency: int | None = None,
+) -> list[Photo]:
+    """Asynchronously scan a directory and hash supported image files.
+
+    Work is parallelized with ``anyio`` to keep UI and event loops responsive.
+    ``max_concurrency`` limits how many images are processed at once; by default
+    it scales with available CPU cores but is capped to avoid overwhelming I/O.
     """
 
     if not directory.exists():
         raise FileNotFoundError(directory)
 
     paths = _collect_paths(directory, recursive)
-    photos: list[Photo] = []
-    for path in paths:
-        try:
-            image = load_image_for_path(path)
-            taken_time = _resolve_taken_time(image, path)
-            hash_hex = compute_phash(image)
-        except Exception as exc:  # pragma: no cover - depends on file content
-            if not ignore_errors:
-                raise
-            logger.warning("Skipping %s: %s", path, exc)
-            continue
+    if not paths:
+        return []
 
-        photos.append(
-            Photo(
-                path=path,
-                taken_time=taken_time,
-                hash_hex=hash_hex,
-                format=path.suffix.upper().lstrip("."),
+    concurrency = max_concurrency or min(32, (os.cpu_count() or 4) * 4)
+    results: dict[int, Photo] = {}
+    lock = anyio.Lock()
+    async with anyio.create_task_group() as tg:
+        semaphore = anyio.Semaphore(concurrency)
+        for idx, path in enumerate(paths):
+            tg.start_soon(
+                _process_path,
+                idx,
+                path,
+                semaphore,
+                lock,
+                results,
+                ignore_errors,
             )
-        )
-    return photos
+
+    return [results[i] for i in range(len(paths)) if i in results]
 
 
 def _collect_paths(directory: Path, recursive: bool) -> list[Path]:
@@ -103,3 +116,36 @@ def _resolve_taken_time(image: Image.Image, path: Path) -> datetime:
     stat = path.stat()
     timestamp = min(stat.st_mtime, stat.st_ctime)
     return datetime.fromtimestamp(timestamp)  # noqa: DTZ006
+
+
+async def _resolve_taken_time_async(image: Image.Image, path: Path) -> datetime:
+    return await to_thread.run_sync(_resolve_taken_time, image, path)
+
+
+async def _process_path(
+    index: int,
+    path: Path,
+    semaphore: anyio.Semaphore,
+    lock: anyio.Lock,
+    results: dict[int, Photo],
+    ignore_errors: bool,
+) -> None:
+    async with semaphore:
+        try:
+            image = await load_image_for_path_async(path)
+            taken_time = await _resolve_taken_time_async(image, path)
+            hash_hex = await compute_phash_async(image)
+        except Exception as exc:  # pragma: no cover - depends on file content
+            if not ignore_errors:
+                raise
+            logger.warning("Skipping %s: %s", path, exc)
+            return
+
+        photo = Photo(
+            path=path,
+            taken_time=taken_time,
+            hash_hex=hash_hex,
+            format=path.suffix.upper().lstrip("."),
+        )
+        async with lock:
+            results[index] = photo

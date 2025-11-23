@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import imagehash
+from anyio import to_thread
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -22,6 +23,12 @@ def compute_phash(image: Image.Image) -> str:
     finally:
         image.close()
     return phash.__str__()
+
+
+async def compute_phash_async(image: Image.Image) -> str:
+    """Asynchronously compute perceptual hash using a worker thread."""
+
+    return await to_thread.run_sync(compute_phash, image)
 
 
 def hamming_distance(hash_a: str, hash_b: str) -> int:
