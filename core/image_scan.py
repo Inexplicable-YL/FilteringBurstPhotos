@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PIL import ExifTags, Image
 
 from .image_hash import compute_phash
+from .image_raw import load_image_for_path
 from .models import Photo
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from pathlib import Path
 
 SUPPORTED_EXTENSIONS: Iterable[str] = {
     ".jpg",
@@ -33,7 +34,7 @@ SUPPORTED_EXTENSIONS: Iterable[str] = {
 logger = logging.getLogger(__name__)
 
 
-EXIF_DATETIME_KEYS = {v: k for k, v in ExifTags.TAGS.items() if v == "DateTimeOriginal"}
+EXIF_DATETIME_KEYS = {k: v for k, v in ExifTags.TAGS.items() if v == "DateTime"}
 
 
 def scan_directory(
@@ -55,8 +56,9 @@ def scan_directory(
     photos: list[Photo] = []
     for path in paths:
         try:
-            taken_time = _resolve_taken_time(path)
-            hash_hex = compute_phash(path)
+            image = load_image_for_path(path)
+            taken_time = _resolve_taken_time(image, path)
+            hash_hex = compute_phash(image)
         except Exception as exc:  # pragma: no cover - depends on file content
             if not ignore_errors:
                 raise
@@ -91,21 +93,20 @@ def _collect_paths(directory: Path, recursive: bool) -> list[Path]:
     )
 
 
-def _resolve_taken_time(path: Path) -> datetime:
+def _resolve_taken_time(image: Image.Image, path: Path) -> datetime:
     try:
-        with Image.open(path) as image:
-            exif = image.getexif()
-            if exif:
-                for key in EXIF_DATETIME_KEYS:
-                    value = exif.get(key)
-                    if value:
-                        try:
-                            return datetime.strptime(str(value), "%Y:%m:%d %H:%M:%S")
-                        except ValueError:
-                            logger.debug("Invalid EXIF date %s in %s", value, path)
+        exif = image.getexif()
+        if exif:
+            for key in EXIF_DATETIME_KEYS:
+                value = exif.get(key)
+                if value:
+                    try:
+                        return datetime.strptime(str(value), "%Y:%m:%d %H:%M:%S")  # noqa: DTZ007
+                    except ValueError:
+                        logger.debug("Invalid EXIF date %s in %s", value, path)
     except Exception as exc:  # pragma: no cover - depends on file availability
         logger.debug("Failed to read EXIF from %s: %s", path, exc)
 
     stat = path.stat()
     timestamp = min(stat.st_mtime, stat.st_ctime)
-    return datetime.fromtimestamp(timestamp)
+    return datetime.fromtimestamp(timestamp)  # noqa: DTZ006

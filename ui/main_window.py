@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 
 from config.settings import Settings
 from core.grouping import group_bursts
-from core.image_raw import load_image_for_hash
+from core.image_raw import load_image_for_path
 from core.image_scan import scan_directory
 from core.models import Group, Photo
 from ui.image_utils import pil_to_qpixmap, scale_pixmap
@@ -253,7 +253,7 @@ class MainWindow(QMainWindow):
             return cached
 
         try:
-            image = load_image_for_hash(photo.path)
+            image = load_image_for_path(photo.path)
             pixmap = scale_pixmap(pil_to_qpixmap(image), self.thumbnail_size)
         except (FileNotFoundError, UnidentifiedImageError, RuntimeError) as exc:
             logger.warning("Unable to load thumbnail for %s: %s", photo.path, exc)
@@ -273,7 +273,7 @@ class MainWindow(QMainWindow):
 
     def _update_preview(self, photo: Photo) -> None:
         try:
-            image = load_image_for_hash(photo.path)
+            image = load_image_for_path(photo.path)
             pixmap = pil_to_qpixmap(image)
             scaled = pixmap.scaled(
                 self.preview_label.width(),

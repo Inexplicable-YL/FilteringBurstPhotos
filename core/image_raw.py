@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PIL import Image, UnidentifiedImageError
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from pathlib import Path
 
 RAW_EXTENSIONS: set[str] = {
     ".cr2",
@@ -24,7 +23,7 @@ class UnsupportedImageError(RuntimeError):
     """Raised when an image cannot be opened for hashing or preview."""
 
 
-def load_image_for_hash(path: Path) -> Image.Image:
+def load_image_for_path(path: Path) -> Image.Image:
     """Return a Pillow ``Image`` suitable for hashing.
 
     RAW files are decoded with ``rawpy`` if available; otherwise a helpful

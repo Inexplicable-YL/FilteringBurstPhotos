@@ -1,22 +1,22 @@
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import imagehash
 
-from .image_raw import load_image_for_hash
+if TYPE_CHECKING:
+    from PIL import Image
 
 HASH_SIZE = 8
 
 
-def compute_phash(path: Path) -> str:
+def compute_phash(image: Image.Image) -> str:
     """Compute a perceptual hash for the given image path.
 
     The function loads the image via :func:`load_image_for_hash`, which handles
     standard formats as well as RAW files (when ``rawpy`` is available).
     """
 
-    image = load_image_for_hash(path)
     try:
         phash = imagehash.phash(image, hash_size=HASH_SIZE)
     finally:

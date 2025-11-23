@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from .image_hash import hamming_distance
 from .models import Group, Photo
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from datetime import datetime
 
 
