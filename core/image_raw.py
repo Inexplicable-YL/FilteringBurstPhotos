@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING
 
 from PIL import Image, UnidentifiedImageError
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
 
 RAW_EXTENSIONS: Iterable[str] = {
     ".cr2",
@@ -41,8 +44,7 @@ def load_image_for_hash(path: Path) -> Image.Image:
 
 
 def _load_raw_as_image(path: Path) -> Image.Image:
-    import rawpy  # type: ignore[import-not-found]
-    import numpy  # type: ignore[import-not-found]
+    import rawpy  # type: ignore[import-not-found]  # noqa: PLC0415
 
     with rawpy.imread(str(path)) as raw:
         rgb = raw.postprocess(

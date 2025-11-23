@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
-from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import TYPE_CHECKING
 
 from .image_hash import hamming_distance
 from .models import Group, Photo
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 def group_bursts(
@@ -13,7 +14,7 @@ def group_bursts(
     time_threshold_seconds: int = 3,
     hash_threshold: int = 5,
     min_group_size: int = 2,
-) -> List[Group]:
+) -> list[Group]:
     """Group photos into burst sequences using time and hash similarity.
 
     Photos are first sorted by capture time then filename to ensure stable
@@ -24,8 +25,8 @@ def group_bursts(
     """
 
     sorted_photos = sorted(photos, key=lambda p: (p.taken_time, p.path.name))
-    groups: List[Group] = []
-    current_group: List[Photo] = []
+    groups: list[Group] = []
+    current_group: list[Photo] = []
     group_id = 1
 
     def commit_group():

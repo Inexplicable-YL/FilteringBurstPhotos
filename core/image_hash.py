@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import imagehash
 
 from .image_raw import load_image_for_hash
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 HASH_SIZE = 8
 

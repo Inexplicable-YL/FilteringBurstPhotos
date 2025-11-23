@@ -1,0 +1,7 @@
+{
+  "scan_recursive": true,
+  "time_threshold_seconds": 3,
+  "hash_threshold": 5,
+  "min_group_size": 2,
+  "duplicate_directory": "_duplicates"
+}

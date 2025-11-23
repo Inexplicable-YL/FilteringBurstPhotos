@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import shutil
-from pathlib import Path
-from typing import Iterable, List
+from typing import TYPE_CHECKING
 
-from .models import Photo
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
+
+    from .models import Photo
 
 
-def select_discarded(photos: Iterable[Photo]) -> List[Photo]:
+def select_discarded(photos: Iterable[Photo]) -> list[Photo]:
     """Return photos marked as not kept."""
 
     return [photo for photo in photos if not photo.keep]
 
 
-def move_photos(photos: Iterable[Photo], destination: Path, dry_run: bool = False) -> int:
+def move_photos(
+    photos: Iterable[Photo], destination: Path, dry_run: bool = False
+) -> int:
     """Move discarded photos to ``destination``.
 
     Returns the number of files moved. Parent directories inside ``destination``

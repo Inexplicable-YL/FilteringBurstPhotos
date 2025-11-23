@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import TYPE_CHECKING
 
 from PIL import ExifTags, Image
 
 from .image_hash import compute_phash
 from .models import Photo
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
+    from pathlib import Path
 
 SUPPORTED_EXTENSIONS: Iterable[str] = {
     ".jpg",
@@ -33,14 +36,14 @@ logger = logging.getLogger(__name__)
 EXIF_DATETIME_KEYS = {v: k for k, v in ExifTags.TAGS.items() if v == "DateTimeOriginal"}
 
 
-def scan_directory(directory: Path, recursive: bool = True) -> List[Photo]:
+def scan_directory(directory: Path, recursive: bool = True) -> list[Photo]:
     """Scan a directory for supported image files and return ``Photo`` items."""
 
     if not directory.exists():
         raise FileNotFoundError(directory)
 
     paths = _collect_paths(directory, recursive)
-    photos: List[Photo] = []
+    photos: list[Photo] = []
     for path in paths:
         taken_time = _resolve_taken_time(path)
         hash_hex = compute_phash(path)
@@ -61,7 +64,11 @@ def _collect_paths(directory: Path, recursive: bool) -> Sequence[Path]:
 
     if recursive:
         return sorted(
-            [path for path in directory.rglob("*") if path.is_file() and is_supported(path)]
+            [
+                path
+                for path in directory.rglob("*")
+                if path.is_file() and is_supported(path)
+            ]
         )
     return sorted(
         [path for path in directory.iterdir() if path.is_file() and is_supported(path)]

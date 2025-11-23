@@ -3,21 +3,21 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Set
 
 import anyio
+from anyio.to_thread import run_sync
 from PIL import UnidentifiedImageError
-from PySide6.QtCore import QPoint, QEvent, QRect, QSize, Qt, Signal, QObject
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QAction, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QHBoxLayout,
     QLabel,
-    QMainWindow,
-    QMessageBox,
     QLayout,
     QLayoutItem,
+    QMainWindow,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -65,18 +65,18 @@ class ScanWorker(QObject):
             logger.exception("Failed during scan")
             self.failed.emit(str(exc))
 
-    async def _scan_and_group(self) -> tuple[List[Photo], List[Group]]:
-        photos = await anyio.to_thread.run_sync(
+    async def _scan_and_group(self) -> tuple[list[Photo], list[Group]]:
+        photos = await run_sync(
             scan_directory,
             self.directory,
-            recursive=self.settings.scan_recursive,
+            self.settings.scan_recursive,
         )
-        groups = await anyio.to_thread.run_sync(
+        groups = await run_sync(
             group_bursts,
             photos,
-            time_threshold_seconds=self.settings.time_threshold_seconds,
-            hash_threshold=self.settings.hash_threshold,
-            min_group_size=self.settings.min_group_size,
+            self.settings.time_threshold_seconds,
+            self.settings.hash_threshold,
+            self.settings.min_group_size,
         )
         return photos, groups
 
@@ -84,21 +84,21 @@ class ScanWorker(QObject):
 class MainWindow(QMainWindow):
     """GUI for browsing and filtering burst photos."""
 
-    def __init__(self, settings: Settings, initial_directory: Optional[Path] = None):
+    def __init__(self, settings: Settings, initial_directory: Path | None = None):
         super().__init__()
         self.settings = settings
-        self.current_directory: Optional[Path] = initial_directory
-        self.photos: List[Photo] = []
-        self.groups: List[Group] = []
+        self.current_directory: Path | None = initial_directory
+        self.photos: list[Photo] = []
+        self.groups: list[Group] = []
 
         self.setWindowTitle("Filtering Burst Photos")
         self.resize(1280, 860)
 
-        self._thumbnail_cache: Dict[Path, QPixmap] = {}
+        self._thumbnail_cache: dict[Path, QPixmap] = {}
         self.thumbnail_size = INITIAL_THUMBNAIL_SIZE
-        self._selected_paths: Set[Path] = set()
-        self._group_widgets: List[GroupWidget] = []
-        self._scan_worker: Optional[ScanWorker] = None
+        self._selected_paths: set[Path] = set()
+        self._group_widgets: list[GroupWidget] = []
+        self._scan_worker: ScanWorker | None = None
 
         self.toolbar = self._build_toolbar()
         self.status_bar = QStatusBar()
@@ -202,11 +202,13 @@ class MainWindow(QMainWindow):
         self._scan_worker.failed.connect(self._on_scan_failed)
         self._scan_worker.start()
 
-    def _on_scan_finished(self, photos: List[Photo], groups: List[Group]) -> None:
+    def _on_scan_finished(self, photos: list[Photo], groups: list[Group]) -> None:
         QApplication.restoreOverrideCursor()
         self.photos = photos
         self.groups = groups
-        self.current_directory = self._scan_worker.directory if self._scan_worker else self.current_directory
+        self.current_directory = (
+            self._scan_worker.directory if self._scan_worker else self.current_directory
+        )
         self._scan_worker = None
         self._populate_groups()
         self.status_bar.showMessage(
@@ -307,10 +309,12 @@ class MainWindow(QMainWindow):
         if not self._selected_paths:
             return
 
-        new_groups: List[Group] = []
-        kept_photos: List[Photo] = []
+        new_groups: list[Group] = []
+        kept_photos: list[Photo] = []
         for group in self.groups:
-            selected_in_group = [photo for photo in group.photos if photo.path in self._selected_paths]
+            selected_in_group = [
+                photo for photo in group.photos if photo.path in self._selected_paths
+            ]
             if not selected_in_group or len(selected_in_group) == len(group.photos):
                 new_groups.append(group)
                 kept_photos.extend(group.photos)
@@ -335,7 +339,10 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, obj, event):  # type: ignore[override]
         if obj is self.thumbnail_scroll.viewport():
-            if event.type() == QEvent.Type.Wheel and QApplication.keyboardModifiers() & Qt.ControlModifier:
+            if (
+                event.type() == QEvent.Type.Wheel
+                and QApplication.keyboardModifiers() & Qt.ControlModifier
+            ):
                 delta = event.angleDelta().y() // 120
                 if delta:
                     new_size = max(
@@ -370,7 +377,7 @@ class FlowLayout(QLayout):
 
     def __init__(self, margin: int = 12, spacing: int = 8):
         super().__init__()
-        self._items: List[QLayoutItem] = []
+        self._items: list[QLayoutItem] = []
         self.setContentsMargins(margin, margin, margin, margin)
         self.setSpacing(spacing)
 
@@ -453,8 +460,8 @@ class FlowLayout(QLayout):
             line_height = max(line_height, hint.height())
         return y + line_height + self.contentsMargins().bottom()
 
-    def row_rects(self, available_width: int) -> List[QRect]:
-        rects: List[QRect] = []
+    def row_rects(self, available_width: int) -> list[QRect]:
+        rects: list[QRect] = []
         x = self.contentsMargins().left()
         y = self.contentsMargins().top()
         line_height = 0
@@ -468,7 +475,14 @@ class FlowLayout(QLayout):
             w, h = widget.sizeHint().width(), widget.sizeHint().height()
             next_x = x + w + spacing
             if next_x - spacing > max_width and line_height > 0:
-                rects.append(QRect(start_x - 6, y - 6, (x - spacing) - start_x + 12, line_height + 12))
+                rects.append(
+                    QRect(
+                        start_x - 6,
+                        y - 6,
+                        (x - spacing) - start_x + 12,
+                        line_height + 12,
+                    )
+                )
                 x = self.contentsMargins().left()
                 y = y + line_height + spacing
                 line_height = 0
@@ -477,7 +491,11 @@ class FlowLayout(QLayout):
             x = next_x
             line_height = max(line_height, h)
         if self._items:
-            rects.append(QRect(start_x - 6, y - 6, (x - spacing) - start_x + 12, line_height + 12))
+            rects.append(
+                QRect(
+                    start_x - 6, y - 6, (x - spacing) - start_x + 12, line_height + 12
+                )
+            )
         return rects
 
 
@@ -512,7 +530,7 @@ class QLayoutItemWrapper(QLayoutItem):
     def heightForWidth(self, width: int) -> int:  # type: ignore[override]
         return self._widget.heightForWidth(width)
 
-    def widget(self) -> Optional[QWidget]:  # type: ignore[override]
+    def widget(self) -> QWidget | None:  # type: ignore[override]
         return self._widget
 
     def isEmpty(self) -> bool:  # type: ignore[override]
@@ -528,7 +546,7 @@ class GroupWidget(QWidget):
         thumbnail_size: int,
         thumbnail_loader,
         on_photo_clicked,
-        parent: Optional[QWidget] = None,
+        parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.group = group
@@ -538,9 +556,11 @@ class GroupWidget(QWidget):
         self.setStyleSheet("background: black;")
         self.flow_layout = FlowLayout(margin=16, spacing=12)
         self.setLayout(self.flow_layout)
-        self.thumbnails: List[PhotoThumbnail] = []
+        self.thumbnails: list[PhotoThumbnail] = []
         for photo in group.photos:
-            thumb = PhotoThumbnail(photo, thumbnail_size, self.thumbnail_loader, self._on_thumb_clicked)
+            thumb = PhotoThumbnail(
+                photo, thumbnail_size, self.thumbnail_loader, self._on_thumb_clicked
+            )
             self.thumbnails.append(thumb)
             self.flow_layout.addWidget(thumb)
 
