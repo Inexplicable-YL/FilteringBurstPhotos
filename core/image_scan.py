@@ -8,27 +8,20 @@ from typing import TYPE_CHECKING
 from PIL import ExifTags, Image
 
 from .image_hash import compute_phash
+from .image_raw import RAW_EXTENSIONS
 from .models import Photo
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-SUPPORTED_EXTENSIONS: Iterable[str] = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".bmp",
-    ".tiff",
-    ".tif",
-    ".cr2",
-    ".cr3",
-    ".nef",
-    ".arw",
-    ".raf",
-    ".orf",
-    ".rw2",
-    ".dng",
-}
+def _discover_supported_extensions() -> set[str]:
+    """Return a normalized set of file extensions supported by the scanner."""
+
+    pil_extensions = {ext.lower() for ext in Image.registered_extensions().keys()}
+    return pil_extensions | {ext.lower() for ext in RAW_EXTENSIONS}
+
+
+SUPPORTED_EXTENSIONS: Iterable[str] = _discover_supported_extensions()
 
 logger = logging.getLogger(__name__)
 
