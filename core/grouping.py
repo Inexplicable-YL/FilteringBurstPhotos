@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from .image_hash import hamming_distance
 from .models import Group, Photo
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from datetime import datetime
 
 
 def group_bursts(
@@ -20,11 +21,11 @@ def group_bursts(
     Photos are first sorted by capture time then filename to ensure stable
     ordering. A new group is started when either the capture time gap or the
     hash distance exceeds the configured thresholds. Groups smaller than
-    ``min_group_size`` are returned as singletons so the UI can still display
-    them consistently.
+    ``min_group_size`` are demoted to singletons (``group_id`` cleared) and are
+    excluded from the grouped output.
     """
 
-    sorted_photos = sorted(photos, key=lambda p: (p.taken_time, p.path.name))
+    sorted_photos = sorted(photos, key=_grouping_sort_key)
     groups: list[Group] = []
     current_group: list[Photo] = []
     group_id = 1
@@ -57,10 +58,18 @@ def group_bursts(
 
     commit_group()
 
-    # Reclassify small groups as singletons
+    filtered_groups: list[Group] = []
     for group in groups:
         if group.size() < min_group_size:
             for photo in group.photos:
                 photo.group_id = None
+            continue
+        filtered_groups.append(group)
 
-    return groups
+    return filtered_groups
+
+
+def _grouping_sort_key(photo: Photo) -> tuple[datetime, str]:
+    """Stable grouping sort key for photos."""
+
+    return (photo.taken_time, photo.path.name)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PIL import ExifTags, Image
@@ -10,8 +11,7 @@ from .image_hash import compute_phash
 from .models import Photo
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
-    from pathlib import Path
+    from collections.abc import Iterable
 
 SUPPORTED_EXTENSIONS: Iterable[str] = {
     ".jpg",
@@ -36,8 +36,17 @@ logger = logging.getLogger(__name__)
 EXIF_DATETIME_KEYS = {v: k for k, v in ExifTags.TAGS.items() if v == "DateTimeOriginal"}
 
 
-def scan_directory(directory: Path, recursive: bool = True) -> list[Photo]:
-    """Scan a directory for supported image files and return ``Photo`` items."""
+def scan_directory(
+    directory: Path, *, recursive: bool = True, ignore_errors: bool = True
+) -> list[Photo]:
+    """Scan a directory for supported image files and return ``Photo`` items.
+
+    Parameters:
+        directory: Root directory to scan.
+        recursive: Whether to recurse into subdirectories.
+        ignore_errors: When ``True`` (default), files that fail to load or hash
+            are skipped with a warning instead of aborting the scan.
+    """
 
     if not directory.exists():
         raise FileNotFoundError(directory)
@@ -45,8 +54,15 @@ def scan_directory(directory: Path, recursive: bool = True) -> list[Photo]:
     paths = _collect_paths(directory, recursive)
     photos: list[Photo] = []
     for path in paths:
-        taken_time = _resolve_taken_time(path)
-        hash_hex = compute_phash(path)
+        try:
+            taken_time = _resolve_taken_time(path)
+            hash_hex = compute_phash(path)
+        except Exception as exc:  # pragma: no cover - depends on file content
+            if not ignore_errors:
+                raise
+            logger.warning("Skipping %s: %s", path, exc)
+            continue
+
         photos.append(
             Photo(
                 path=path,
@@ -58,7 +74,7 @@ def scan_directory(directory: Path, recursive: bool = True) -> list[Photo]:
     return photos
 
 
-def _collect_paths(directory: Path, recursive: bool) -> Sequence[Path]:
+def _collect_paths(directory: Path, recursive: bool) -> list[Path]:
     def is_supported(path: Path) -> bool:
         return path.suffix.lower() in SUPPORTED_EXTENSIONS
 
@@ -91,4 +107,5 @@ def _resolve_taken_time(path: Path) -> datetime:
         logger.debug("Failed to read EXIF from %s: %s", path, exc)
 
     stat = path.stat()
-    return datetime.fromtimestamp(stat.st_mtime)
+    timestamp = min(stat.st_mtime, stat.st_ctime)
+    return datetime.fromtimestamp(timestamp)

@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import imagehash
 
 from .image_raw import load_image_for_hash
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 HASH_SIZE = 8
 
@@ -20,7 +17,10 @@ def compute_phash(path: Path) -> str:
     """
 
     image = load_image_for_hash(path)
-    phash = imagehash.phash(image, hash_size=HASH_SIZE)
+    try:
+        phash = imagehash.phash(image, hash_size=HASH_SIZE)
+    finally:
+        image.close()
     return phash.__str__()
 
 
