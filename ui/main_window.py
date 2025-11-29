@@ -16,6 +16,7 @@ from PySide6.QtCore import (
     QRect,
     QSize,
     Qt,
+    QTimer,
     Signal,
 )
 from PySide6.QtGui import (
@@ -128,6 +129,9 @@ class MainWindow(QMainWindow):
         self._group_widgets: list[GroupWidget] = []
         self._scan_worker: ScanWorker | None = None
         self._photo_lookup: dict[Path, Photo] = {}
+        self._background_timer = QTimer(self)
+        self._background_timer.setSingleShot(True)
+        self._background_timer.timeout.connect(self._background_load_step)
 
         self.toolbar = self._build_toolbar()
         self.status_bar = QStatusBar()
@@ -291,6 +295,7 @@ class MainWindow(QMainWindow):
 
         self.group_layout.addStretch()
         self._load_visible_thumbnails()
+        self._schedule_background_loading(240)
 
     def _get_base_pixmap(self, photo: Photo) -> QPixmap:
         cached = self._base_pixmap_cache.get(photo.path)
@@ -417,7 +422,7 @@ class MainWindow(QMainWindow):
             and QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier
         ):
             wheel_event = cast("QWheelEvent", event)
-            delta = wheel_event.angleDelta().y() // 120
+            delta = wheel_event.angleDelta().y() // 240
             if delta:
                 new_size = max(
                     THUMBNAIL_MIN_SIZE,
@@ -434,6 +439,7 @@ class MainWindow(QMainWindow):
         for widget in self._group_widgets:
             widget.update_thumbnail_size(self.thumbnail_size)
         self._load_visible_thumbnails()
+        self._schedule_background_loading(240)
 
     @override
     def resizeEvent(self, event: QResizeEvent) -> None:
@@ -442,9 +448,11 @@ class MainWindow(QMainWindow):
         if self._last_preview_photo:
             self._update_preview(self._last_preview_photo)
         self._load_visible_thumbnails()
+        self._schedule_background_loading(240)
 
     def _on_scrollbar_changed(self) -> None:
         self._load_visible_thumbnails()
+        self._schedule_background_loading(240)
 
     def _visible_content_rect(self) -> QRect:
         viewport = self.thumbnail_scroll.viewport()
@@ -462,6 +470,41 @@ class MainWindow(QMainWindow):
             if not group_rect.intersects(visible):
                 continue
             widget.ensure_visible_thumbnails(visible.translated(-group_rect.topLeft()))
+        self._schedule_background_loading(240)
+
+    def _distance_to_visible(self, rect: QRect, visible: QRect) -> int:
+        if rect.intersects(visible):
+            return 0
+        dx = max(visible.left() - rect.right(), rect.left() - visible.right(), 0)
+        dy = max(visible.top() - rect.bottom(), rect.top() - visible.bottom(), 0)
+        return dx + dy
+
+    def _schedule_background_loading(self, delay_ms: int = 80) -> None:
+        self._background_timer.stop()
+        self._background_timer.start(delay_ms)
+
+    def _background_load_step(self) -> None:
+        visible = self._visible_content_rect()
+        candidates: list[tuple[int, int, PhotoThumbnail]] = []
+        for widget in self._group_widgets:
+            offset = widget.pos()
+            for thumb in widget.thumbnails:
+                if not thumb.should_load():
+                    continue
+                rect = thumb.geometry().translated(offset)
+                distance = self._distance_to_visible(rect, visible)
+                candidates.append((distance, rect.top(), thumb))
+
+        if not candidates:
+            return
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        batch_size = 3
+        for _, _, thumb in candidates[:batch_size]:
+            thumb.ensure_loaded()
+
+        if len(candidates) > batch_size:
+            self._schedule_background_loading(40)
 
 
 class FlowLayout(QLayout):
@@ -785,12 +828,17 @@ class PhotoThumbnail(QWidget):
         self.update()
 
     def ensure_loaded(self) -> None:
-        if not self.image_label.isVisible():
+        if not self.should_load():
             return
-        if self._needs_pixmap:
-            scaled = self.loader(self.photo)
-            self.image_label.setPixmap(scaled)
-            self._needs_pixmap = False
+        self._load_pixmap()
+
+    def should_load(self) -> bool:
+        return self.image_label.isVisible() and self._needs_pixmap
+
+    def _load_pixmap(self) -> None:
+        scaled = self.loader(self.photo)
+        self.image_label.setPixmap(scaled)
+        self._needs_pixmap = False
 
 
 class ThumbnailScrollArea(QScrollArea):

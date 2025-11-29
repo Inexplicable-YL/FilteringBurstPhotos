@@ -67,7 +67,7 @@ async def scan_directory_async(
     if not paths:
         return []
 
-    concurrency = max_concurrency or min(32, (os.cpu_count() or 4) * 2)
+    concurrency = max_concurrency or min(16, (os.cpu_count() or 4) * 2)
     results: dict[int, Photo] = {}
     async with anyio.create_task_group() as tg:
         semaphore = anyio.Semaphore(concurrency)
