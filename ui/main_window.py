@@ -18,7 +18,17 @@ from PySide6.QtCore import (
     Qt,
     Signal,
 )
-from PySide6.QtGui import QAction, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QIcon,
+    QMouseEvent,
+    QPainter,
+    QPaintEvent,
+    QPen,
+    QPixmap,
+    QResizeEvent,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -41,9 +51,11 @@ from PySide6.QtWidgets import (
 from _count_time import timer
 from core.grouping import group_bursts
 from core.image_scan import scan_directory_async
-from ui.image_utils import scale_pixmap
+from ui.image_utils import pil_to_qpixmap, scale_pixmap
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from config.settings import Settings
     from core.models import Group, Photo
 
@@ -108,6 +120,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Filtering Burst Photos")
         self.resize(1280, 860)
 
+        self._base_pixmap_cache: dict[Path, QPixmap] = {}
         self._thumbnail_cache: dict[tuple[Path, int], QPixmap] = {}
         self.thumbnail_size = INITIAL_THUMBNAIL_SIZE
         self._selected_paths: set[Path] = set()
@@ -131,6 +144,12 @@ class MainWindow(QMainWindow):
         self.thumbnail_scroll.setWidgetResizable(True)
         self.thumbnail_scroll.setWidget(self.thumbnail_container)
         self.thumbnail_scroll.viewport().installEventFilter(self)
+        self.thumbnail_scroll.verticalScrollBar().valueChanged.connect(
+            self._on_scrollbar_changed
+        )
+        self.thumbnail_scroll.horizontalScrollBar().valueChanged.connect(
+            self._on_scrollbar_changed
+        )
 
         self.cancel_button = QPushButton("取消")
         self.save_button = QPushButton("保存")
@@ -246,6 +265,7 @@ class MainWindow(QMainWindow):
     def _populate_groups(self) -> None:
         self._clear_layout(self.group_layout)
         self._group_widgets.clear()
+        self._base_pixmap_cache.clear()
         self._thumbnail_cache.clear()
         self._selected_paths.clear()
         self._reset_preview()
@@ -270,6 +290,22 @@ class MainWindow(QMainWindow):
                 self.group_layout.addWidget(widget)
 
         self.group_layout.addStretch()
+        self._load_visible_thumbnails()
+
+    def _get_base_pixmap(self, photo: Photo) -> QPixmap:
+        cached = self._base_pixmap_cache.get(photo.path)
+        if cached:
+            return cached
+
+        try:
+            pixmap = pil_to_qpixmap(photo.image)
+        except RuntimeError as exc:
+            logger.warning("Unable to load image for %s: %s", photo.path, exc)
+            pixmap = QPixmap(self.thumbnail_size, self.thumbnail_size)
+            pixmap.fill(Qt.GlobalColor.darkGray)
+
+        self._base_pixmap_cache[photo.path] = pixmap
+        return pixmap
 
     def _load_thumbnail(self, photo: Photo) -> QPixmap:
         key = (photo.path, self.thumbnail_size)
@@ -277,9 +313,10 @@ class MainWindow(QMainWindow):
         if cached:
             return cached
 
-        pixmap = scale_pixmap(photo.pixmap, self.thumbnail_size)
-        self._thumbnail_cache[key] = pixmap
-        return pixmap
+        scaled = scale_pixmap(self._get_base_pixmap(photo), self.thumbnail_size)
+        photo.image.close()
+        self._thumbnail_cache[key] = scaled
+        return scaled
 
     def _on_photo_clicked(self, photo: Photo, selected: bool) -> None:
         if selected:
@@ -302,7 +339,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            scaled = photo.pixmap.scaled(
+            scaled = self._get_base_pixmap(photo).scaled(
                 self.preview_label.width(),
                 self.preview_label.height(),
                 Qt.AspectRatioMode.KeepAspectRatio,
@@ -374,12 +411,13 @@ class MainWindow(QMainWindow):
                 self._clear_layout(child_layout)
 
     @override
-    def eventFilter(self, obj, event):
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
         if obj is self.thumbnail_scroll.viewport() and (
             event.type() == QEvent.Type.Wheel
             and QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier
         ):
-            delta = event.angleDelta().y() // 120
+            wheel_event = cast("QWheelEvent", event)
+            delta = wheel_event.angleDelta().y() // 120
             if delta:
                 new_size = max(
                     THUMBNAIL_MIN_SIZE,
@@ -387,7 +425,7 @@ class MainWindow(QMainWindow):
                 )
                 if new_size != self.thumbnail_size:
                     self.thumbnail_size = new_size
-                    self._refresh_thumbnail_sizes()
+                self._refresh_thumbnail_sizes()
             return True
         return super().eventFilter(obj, event)
 
@@ -395,19 +433,41 @@ class MainWindow(QMainWindow):
         self._thumbnail_cache.clear()
         for widget in self._group_widgets:
             widget.update_thumbnail_size(self.thumbnail_size)
+        self._load_visible_thumbnails()
 
     @override
-    def resizeEvent(self, event) -> None:
+    def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
         # Refresh preview size when the window changes.
         if self._last_preview_photo:
             self._update_preview(self._last_preview_photo)
+        self._load_visible_thumbnails()
+
+    def _on_scrollbar_changed(self) -> None:
+        self._load_visible_thumbnails()
+
+    def _visible_content_rect(self) -> QRect:
+        viewport = self.thumbnail_scroll.viewport()
+        return QRect(
+            self.thumbnail_scroll.horizontalScrollBar().value(),
+            self.thumbnail_scroll.verticalScrollBar().value(),
+            viewport.width(),
+            viewport.height(),
+        )
+
+    def _load_visible_thumbnails(self) -> None:
+        visible = self._visible_content_rect()
+        for widget in self._group_widgets:
+            group_rect = widget.geometry()
+            if not group_rect.intersects(visible):
+                continue
+            widget.ensure_visible_thumbnails(visible.translated(-group_rect.topLeft()))
 
 
 class FlowLayout(QLayout):
     """A simple flow layout that wraps children horizontally."""
 
-    def __init__(self, margin: int = 12, spacing: int = 8):
+    def __init__(self, margin: int = 12, spacing: int = 8) -> None:
         super().__init__()
         self._items: list[QLayoutItem] = []
         self.setContentsMargins(margin, margin, margin, margin)
@@ -427,17 +487,17 @@ class FlowLayout(QLayout):
         return len(self._items)
 
     @override
-    def itemAt(self, index: int):
+    def itemAt(self, index: int) -> QLayoutItem | None:
         if 0 <= index < len(self._items):
             return self._items[index]
         return None
 
     @override
-    def takeAt(self, index: int):
+    def takeAt(self, index: int) -> QLayoutItem:
         return self._items.pop(index)
 
     @override
-    def sizeHint(self):
+    def sizeHint(self) -> QSize:
         width = self.parentWidget().width() if self.parentWidget() else 800
         return QSize(width, self._height_for_width(width))
 
@@ -447,7 +507,7 @@ class FlowLayout(QLayout):
         return QSize(width, self._height_for_width(width))
 
     @override
-    def expandingDirections(self):
+    def expandingDirections(self) -> Qt.Orientation:
         return Qt.Orientation(0)
 
     @override
@@ -541,7 +601,7 @@ class FlowLayout(QLayout):
 class QLayoutItemWrapper(QLayoutItem):
     """Simple wrapper to let FlowLayout store widgets."""
 
-    def __init__(self, widget: QWidget):
+    def __init__(self, widget: QWidget) -> None:
         super().__init__()
         self._widget = widget
 
@@ -566,7 +626,7 @@ class QLayoutItemWrapper(QLayoutItem):
         return self._widget.maximumSize()
 
     @override
-    def expandingDirections(self):
+    def expandingDirections(self) -> Qt.Orientation:
         return Qt.Orientation(0)
 
     @override
@@ -593,14 +653,14 @@ class GroupWidget(QWidget):
         self,
         group: Group,
         thumbnail_size: int,
-        thumbnail_loader,
-        on_photo_clicked,
+        thumbnail_loader: Callable[[Photo], QPixmap],
+        on_photo_clicked: Callable[[Photo, bool], None],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.group = group
-        self.thumbnail_loader = thumbnail_loader
-        self.on_photo_clicked = on_photo_clicked
+        self.thumbnail_loader: Callable[[Photo], QPixmap] = thumbnail_loader
+        self.on_photo_clicked: Callable[[Photo, bool], None] = on_photo_clicked
 
         self.setStyleSheet("background: black;")
         self.flow_layout = FlowLayout(margin=16, spacing=12)
@@ -621,14 +681,22 @@ class GroupWidget(QWidget):
             thumb.update_size(new_size)
         self.updateGeometry()
         self.update()
+        self.ensure_visible_thumbnails(self.rect())
 
     def clear_selection(self) -> None:
         for thumb in self.thumbnails:
             thumb.set_selected(False)
         self.update()
 
+    def ensure_visible_thumbnails(self, visible_rect: QRect) -> None:
+        margin = 64
+        for thumb in self.thumbnails:
+            rect = thumb.geometry().adjusted(-margin, -margin, margin, margin)
+            if rect.intersects(visible_rect):
+                thumb.ensure_loaded()
+
     @override
-    def paintEvent(self, event):
+    def paintEvent(self, event: QPaintEvent) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), Qt.GlobalColor.black)
@@ -648,12 +716,21 @@ class GroupWidget(QWidget):
 class PhotoThumbnail(QWidget):
     """Thumbnail widget supporting selection and dynamic sizing."""
 
-    def __init__(self, photo: Photo, size: int, loader, on_clicked) -> None:
+    def __init__(
+        self,
+        photo: Photo,
+        size: int,
+        loader: Callable[[Photo], QPixmap],
+        on_clicked: Callable[[Photo, bool], None],
+    ) -> None:
         super().__init__()
         self.photo = photo
-        self.loader = loader
-        self.on_clicked = on_clicked
+        self.loader: Callable[[Photo], QPixmap] = loader
+        self.on_clicked: Callable[[Photo, bool], None] = on_clicked
         self.is_selected = False
+        self._size_hint: QSize
+        self._needs_pixmap = True
+        self._current_size = size
 
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -677,7 +754,7 @@ class PhotoThumbnail(QWidget):
         return self._size_hint
 
     @override
-    def mousePressEvent(self, event):
+    def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self.set_selected(not self.is_selected)
             self.on_clicked(self.photo, self.is_selected)
@@ -691,25 +768,36 @@ class PhotoThumbnail(QWidget):
         )
 
     def update_size(self, size: int) -> None:
-        scaled = self.loader(self.photo)
+        self._current_size = size
         minimal = size < 70  # noqa: PLR2004
         self.image_label.setVisible(not minimal)
         if not minimal:
-            self.image_label.setPixmap(scaled)
             self.image_label.setFixedSize(QSize(size, size))
+        else:
+            self.image_label.clear()
         self.text_label.setFixedWidth(size + 8)
         font = self.text_label.font()
         font.setPointSizeF(max(8.0, size / 14))
         self.text_label.setFont(font)
         self._size_hint = QSize(size + 12, (size if not minimal else 0) + 32)
+        self._needs_pixmap = True
+        self.ensure_loaded()
         self.update()
+
+    def ensure_loaded(self) -> None:
+        if not self.image_label.isVisible():
+            return
+        if self._needs_pixmap:
+            scaled = self.loader(self.photo)
+            self.image_label.setPixmap(scaled)
+            self._needs_pixmap = False
 
 
 class ThumbnailScrollArea(QScrollArea):
     """Scroll area that forwards wheel events for zooming."""
 
     @override
-    def wheelEvent(self, event):
+    def wheelEvent(self, event: QWheelEvent) -> None:
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             event.ignore()
             return

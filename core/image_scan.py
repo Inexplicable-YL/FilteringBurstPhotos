@@ -9,8 +9,6 @@ import anyio
 from anyio.to_thread import run_sync
 from PIL import ExifTags, Image
 
-from ui.image_utils import pil_to_qpixmap
-
 from .image_hash import compute_phash_async
 from .image_raw import RAW_EXTENSIONS, load_image_for_path_async
 from .models import Photo
@@ -134,8 +132,6 @@ async def _process_path(
             image = await load_image_for_path_async(path)
             taken_time = await run_sync(_resolve_taken_time, image, path)
             hash_hex = await compute_phash_async(image)
-            pixmap = await run_sync(pil_to_qpixmap, image)
-            image.close()
         except Exception as exc:  # pragma: no cover - depends on file content
             if not ignore_errors:
                 raise
@@ -144,7 +140,7 @@ async def _process_path(
 
         results[index] = Photo(
             path=path,
-            pixmap=pixmap,
+            image=image,
             taken_time=taken_time,
             hash_hex=hash_hex,
             format=path.suffix.upper().lstrip("."),
