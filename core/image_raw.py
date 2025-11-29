@@ -58,6 +58,7 @@ def _load_standard_image(path: Path) -> Image.Image:
     """Load a non-RAW image and ensure it is an RGB pillow instance."""
 
     with Image.open(path) as image:
+        image.load()
         return image.convert("RGB")
 
 

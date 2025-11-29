@@ -10,7 +10,9 @@ def pil_to_qpixmap(image: Image.Image) -> QPixmap:
 
     prepared = _ensure_rgba(image)
     data = prepared.tobytes("raw", "RGBA")
-    qimage = QImage(data, prepared.width, prepared.height, QImage.Format_RGBA8888)
+    qimage = QImage(
+        data, prepared.width, prepared.height, QImage.Format.Format_RGBA8888
+    )
     return QPixmap.fromImage(qimage)
 
 
@@ -19,7 +21,12 @@ def scale_pixmap(pixmap: QPixmap, max_size: int) -> QPixmap:
 
     if pixmap.isNull():
         return pixmap
-    return pixmap.scaled(max_size, max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return pixmap.scaled(
+        max_size,
+        max_size,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
 
 
 def _ensure_rgba(image: Image.Image) -> Image.Image:

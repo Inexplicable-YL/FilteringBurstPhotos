@@ -39,7 +39,11 @@ def scan_directory(
     """Synchronous wrapper for :func:`scan_directory_async`."""
 
     return anyio.run(
-        scan_directory_async, directory, recursive, ignore_errors, max_concurrency
+        scan_directory_async,
+        directory,
+        recursive,
+        ignore_errors,
+        max_concurrency,
     )
 
 

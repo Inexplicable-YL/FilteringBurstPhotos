@@ -60,7 +60,7 @@ def main() -> None:
     )
 
     if args.gui:
-        from ui.app import run_gui
+        from ui.app import run_gui  # noqa: PLC0415
 
         run_gui(effective, args.directory)
         save_settings(effective)
