@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-from PIL import Image
+from typing import TYPE_CHECKING
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 
 def pil_to_qpixmap(image: Image.Image) -> QPixmap:

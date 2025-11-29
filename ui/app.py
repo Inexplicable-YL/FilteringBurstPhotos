@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import QApplication
 
-from config.settings import Settings
 from ui.main_window import MainWindow
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from config.settings import Settings
 
 
 def run_gui(settings: Settings, initial_directory: Path | None = None) -> None:

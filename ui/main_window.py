@@ -255,6 +255,8 @@ class MainWindow(QMainWindow):
             self._scan_worker.directory if self._scan_worker else self.current_directory
         )
         self._scan_worker = None
+        self._base_pixmap_cache.clear()
+        self._thumbnail_cache.clear()
         self._populate_groups()
         self.status_bar.showMessage(
             f"找到 {len(self.photos)} 张照片，{len(self.groups)} 个连拍组", 5000
@@ -269,8 +271,6 @@ class MainWindow(QMainWindow):
     def _populate_groups(self) -> None:
         self._clear_layout(self.group_layout)
         self._group_widgets.clear()
-        self._base_pixmap_cache.clear()
-        self._thumbnail_cache.clear()
         self._selected_paths.clear()
         self._reset_preview()
         self._set_action_buttons_enabled(False)
