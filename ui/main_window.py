@@ -8,7 +8,6 @@ from typing_extensions import override
 
 import anyio
 from anyio.to_thread import run_sync
-from PIL import UnidentifiedImageError
 from PySide6.QtCore import (
     QCoreApplication,
     QEvent,
@@ -39,10 +38,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from _count_time import timer
 from core.grouping import group_bursts
-from core.image_raw import load_image_for_path
 from core.image_scan import scan_directory_async
-from ui.image_utils import pil_to_qpixmap, scale_pixmap
+from ui.image_utils import scale_pixmap
 
 if TYPE_CHECKING:
     from config.settings import Settings
@@ -79,16 +78,18 @@ class ScanWorker(QObject):
             self.failed.emit(str(exc))
 
     async def _scan_and_group(self) -> tuple[list[Photo], list[Group]]:
-        photos = await scan_directory_async(
-            self.directory, self.settings.scan_recursive, True
-        )
-        groups = await run_sync(
-            group_bursts,
-            photos,
-            self.settings.time_threshold_seconds,
-            self.settings.hash_threshold,
-            self.settings.min_group_size,
-        )
+        with timer("Scan Directory"):
+            photos = await scan_directory_async(
+                self.directory,
+                recursive=self.settings.scan_recursive,
+            )
+            groups = await run_sync(
+                group_bursts,
+                photos,
+                self.settings.time_threshold_seconds,
+                self.settings.hash_threshold,
+                self.settings.min_group_size,
+            )
         return photos, groups
 
 
@@ -107,7 +108,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Filtering Burst Photos")
         self.resize(1280, 860)
 
-        self._base_pixmap_cache: dict[Path, QPixmap] = {}
         self._thumbnail_cache: dict[tuple[Path, int], QPixmap] = {}
         self.thumbnail_size = INITIAL_THUMBNAIL_SIZE
         self._selected_paths: set[Path] = set()
@@ -247,7 +247,6 @@ class MainWindow(QMainWindow):
         self._clear_layout(self.group_layout)
         self._group_widgets.clear()
         self._thumbnail_cache.clear()
-        self._base_pixmap_cache.clear()
         self._selected_paths.clear()
         self._reset_preview()
         self._set_action_buttons_enabled(False)
@@ -259,33 +258,18 @@ class MainWindow(QMainWindow):
             self.group_layout.addWidget(placeholder)
             return
 
-        for group in self.groups:
-            widget = GroupWidget(
-                group=group,
-                thumbnail_size=self.thumbnail_size,
-                thumbnail_loader=self._load_thumbnail,
-                on_photo_clicked=self._on_photo_clicked,
-            )
-            self._group_widgets.append(widget)
-            self.group_layout.addWidget(widget)
+        with timer("Populate Groups"):
+            for group in self.groups:
+                widget = GroupWidget(
+                    group=group,
+                    thumbnail_size=self.thumbnail_size,
+                    thumbnail_loader=self._load_thumbnail,
+                    on_photo_clicked=self._on_photo_clicked,
+                )
+                self._group_widgets.append(widget)
+                self.group_layout.addWidget(widget)
 
         self.group_layout.addStretch()
-
-    def _get_base_pixmap(self, photo: Photo) -> QPixmap:
-        cached = self._base_pixmap_cache.get(photo.path)
-        if cached:
-            return cached
-
-        try:
-            image = load_image_for_path(photo.path)
-            pixmap = pil_to_qpixmap(image)
-        except (FileNotFoundError, UnidentifiedImageError, RuntimeError) as exc:
-            logger.warning("Unable to load image for %s: %s", photo.path, exc)
-            pixmap = QPixmap(self.thumbnail_size, self.thumbnail_size)
-            pixmap.fill(Qt.GlobalColor.darkGray)
-
-        self._base_pixmap_cache[photo.path] = pixmap
-        return pixmap
 
     def _load_thumbnail(self, photo: Photo) -> QPixmap:
         key = (photo.path, self.thumbnail_size)
@@ -293,8 +277,7 @@ class MainWindow(QMainWindow):
         if cached:
             return cached
 
-        base_pixmap = self._get_base_pixmap(photo)
-        pixmap = scale_pixmap(base_pixmap, self.thumbnail_size)
+        pixmap = scale_pixmap(photo.pixmap, self.thumbnail_size)
         self._thumbnail_cache[key] = pixmap
         return pixmap
 
@@ -319,8 +302,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            pixmap = self._get_base_pixmap(photo)
-            scaled = pixmap.scaled(
+            scaled = photo.pixmap.scaled(
                 self.preview_label.width(),
                 self.preview_label.height(),
                 Qt.AspectRatioMode.KeepAspectRatio,
@@ -709,8 +691,7 @@ class PhotoThumbnail(QWidget):
         )
 
     def update_size(self, size: int) -> None:
-        pixmap = self.loader(self.photo)
-        scaled = scale_pixmap(pixmap, size)
+        scaled = self.loader(self.photo)
         minimal = size < 70  # noqa: PLR2004
         self.image_label.setVisible(not minimal)
         if not minimal:

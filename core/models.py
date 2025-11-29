@@ -7,6 +7,8 @@ if TYPE_CHECKING:
     from datetime import datetime
     from pathlib import Path
 
+    from PySide6.QtGui import QPixmap
+
 
 @dataclass
 class Photo:
@@ -22,6 +24,7 @@ class Photo:
     """
 
     path: Path
+    pixmap: QPixmap
     taken_time: datetime
     hash_hex: str
     format: str

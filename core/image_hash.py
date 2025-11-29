@@ -17,11 +17,7 @@ def compute_phash(image: Image.Image) -> str:
     The function loads the image via :func:`load_image_for_hash`, which handles
     standard formats as well as RAW files (when ``rawpy`` is available).
     """
-
-    try:
-        phash = imagehash.phash(image, hash_size=HASH_SIZE)
-    finally:
-        image.close()
+    phash = imagehash.phash(image, hash_size=HASH_SIZE)
     return phash.__str__()
 
 

@@ -6,8 +6,10 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 import anyio
-from anyio import to_thread
+from anyio.to_thread import run_sync
 from PIL import ExifTags, Image
+
+from ui.image_utils import pil_to_qpixmap
 
 from .image_hash import compute_phash_async
 from .image_raw import RAW_EXTENSIONS, load_image_for_path_async
@@ -67,9 +69,8 @@ async def scan_directory_async(
     if not paths:
         return []
 
-    concurrency = max_concurrency or min(32, (os.cpu_count() or 4) * 4)
+    concurrency = max_concurrency or min(32, (os.cpu_count() or 4) * 2)
     results: dict[int, Photo] = {}
-    lock = anyio.Lock()
     async with anyio.create_task_group() as tg:
         semaphore = anyio.Semaphore(concurrency)
         for idx, path in enumerate(paths):
@@ -78,7 +79,6 @@ async def scan_directory_async(
                 idx,
                 path,
                 semaphore,
-                lock,
                 results,
                 ignore_errors,
             )
@@ -122,34 +122,30 @@ def _resolve_taken_time(image: Image.Image, path: Path) -> datetime:
     return datetime.fromtimestamp(timestamp)  # noqa: DTZ006
 
 
-async def _resolve_taken_time_async(image: Image.Image, path: Path) -> datetime:
-    return await to_thread.run_sync(_resolve_taken_time, image, path)
-
-
 async def _process_path(
     index: int,
     path: Path,
     semaphore: anyio.Semaphore,
-    lock: anyio.Lock,
     results: dict[int, Photo],
     ignore_errors: bool,
 ) -> None:
     async with semaphore:
         try:
             image = await load_image_for_path_async(path)
-            taken_time = await _resolve_taken_time_async(image, path)
+            taken_time = await run_sync(_resolve_taken_time, image, path)
             hash_hex = await compute_phash_async(image)
+            pixmap = await run_sync(pil_to_qpixmap, image)
+            image.close()
         except Exception as exc:  # pragma: no cover - depends on file content
             if not ignore_errors:
                 raise
             logger.warning("Skipping %s: %s", path, exc)
             return
 
-        photo = Photo(
+        results[index] = Photo(
             path=path,
+            pixmap=pixmap,
             taken_time=taken_time,
             hash_hex=hash_hex,
             format=path.suffix.upper().lstrip("."),
         )
-        async with lock:
-            results[index] = photo
