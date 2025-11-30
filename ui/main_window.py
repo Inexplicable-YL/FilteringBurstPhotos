@@ -10,7 +10,6 @@ import anyio
 from anyio.to_thread import run_sync
 from PySide6.QtCore import (
     QCoreApplication,
-    QEvent,
     QObject,
     QPoint,
     QRect,
@@ -41,7 +40,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSplitter,
     QStatusBar,
     QToolBar,
@@ -174,15 +172,16 @@ class MainWindow(QMainWindow):
         left_layout.setSpacing(0)
         left_layout.addWidget(self.thumbnail_scroll)
         left_layout.addWidget(buttons_container)
-        left_container = QWidget()
+        left_container = LeftContainer()
         left_container.setLayout(left_layout)
+        left_container.ctrl_scroll.connect(self._update_thumbnail_size)
 
-        self.preview_label = QLabel("选择一张照片查看预览")
+        self.preview_label = PreviewLabel("选择一张照片查看预览")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
         self.preview_label.setStyleSheet("background: #111; color: #ccc;")
+        self.preview_label.size_changed.connect(
+            lambda _: self._update_preview(self._last_preview_photo)
+        )
 
         splitter = QSplitter()
         splitter.addWidget(left_container)
@@ -415,24 +414,18 @@ class MainWindow(QMainWindow):
             if child_layout:
                 self._clear_layout(child_layout)
 
-    @override
-    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
-        if obj is self.thumbnail_scroll.viewport() and (
-            event.type() == QEvent.Type.Wheel
-            and QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier
-        ):
-            wheel_event = cast("QWheelEvent", event)
-            delta = wheel_event.angleDelta().y() // 240
-            if delta:
-                new_size = max(
+    def _update_thumbnail_size(self, event: QWheelEvent) -> None:
+        delta = event.angleDelta().y() / 240
+        if delta:
+            new_size = int(
+                max(
                     THUMBNAIL_MIN_SIZE,
                     min(THUMBNAIL_MAX_SIZE, self.thumbnail_size + delta * 12),
                 )
-                if new_size != self.thumbnail_size:
-                    self.thumbnail_size = new_size
-                self._refresh_thumbnail_sizes()
-            return True
-        return super().eventFilter(obj, event)
+            )
+            if new_size != self.thumbnail_size:
+                self.thumbnail_size = new_size
+            self._refresh_thumbnail_sizes()
 
     def _refresh_thumbnail_sizes(self) -> None:
         self._thumbnail_cache.clear()
@@ -505,6 +498,36 @@ class MainWindow(QMainWindow):
 
         if len(candidates) > batch_size:
             self._schedule_background_loading(40)
+
+
+class LeftContainer(QWidget):
+    ctrl_scroll = Signal(QWheelEvent)
+
+    @override
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.ctrl_scroll.emit(event)
+        else:
+            super().wheelEvent(event)
+
+
+class PreviewLabel(QLabel):
+    size_changed = Signal(QSize)
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._size_change_timer = QTimer(self)
+        self._size_change_timer.setSingleShot(True)
+        self._size_change_timer.timeout.connect(self._emit_size_changed)
+
+    @override
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._size_change_timer.stop()
+        self._size_change_timer.start(100)
+
+    def _emit_size_changed(self) -> None:
+        self.size_changed.emit(self.size())
 
 
 class FlowLayout(QLayout):
