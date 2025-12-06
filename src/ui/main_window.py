@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, cast
 from typing_extensions import override
 
 import anyio
-from anyio.to_thread import run_sync
 from PySide6.QtCore import (
     QCoreApplication,
     QObject,
@@ -47,9 +46,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.grouping import group_bursts
-from core.image_scan import scan_directory_async
-from src._count_time import timer
+from _count_time import timer
+from core.image_scan import StreamingBurstGrouper
 from ui.image_utils import pil_to_qpixmap, scale_pixmap
 
 if TYPE_CHECKING:
@@ -89,19 +87,22 @@ class ScanWorker(QObject):
             self.failed.emit(str(exc))
 
     async def _scan_and_group(self) -> tuple[list[Photo], list[Group]]:
+        grouper = StreamingBurstGrouper(
+            time_gap_seconds=2.0,
+            hash_threshold=self.settings.hash_threshold,
+            min_group_size=self.settings.min_group_size,
+        )
+        last_snapshot = None
         with timer("Scan Directory"):
-            photos = await scan_directory_async(
+            async for snapshot in grouper.iter_groups(
                 self.directory,
                 recursive=self.settings.scan_recursive,
-            )
-            groups = await run_sync(
-                group_bursts,
-                photos,
-                self.settings.time_threshold_seconds,
-                self.settings.hash_threshold,
-                self.settings.min_group_size,
-            )
-        return photos, groups
+            ):
+                last_snapshot = snapshot
+
+        if last_snapshot is None:
+            return [], []
+        return last_snapshot.photos, last_snapshot.groups
 
 
 class MainWindow(QMainWindow):

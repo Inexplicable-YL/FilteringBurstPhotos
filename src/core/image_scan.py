@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+from bisect import bisect_left
+from collections import defaultdict
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -9,12 +11,15 @@ import anyio
 from anyio.to_thread import run_sync
 from PIL import ExifTags, Image
 
-from .image_hash import compute_phash_async
+from .image_hash import compute_phash_async, hamming_distance
 from .image_raw import RAW_EXTENSIONS, load_image_for_path_async
-from .models import Photo
+from .models import Group, GroupingResult, Photo
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
     from pathlib import Path
+
+    from anyio.abc import ObjectSendStream
 logger = logging.getLogger(__name__)
 
 
@@ -36,12 +41,7 @@ async def scan_directory_async(
     ignore_errors: bool = True,
     max_concurrency: int | None = None,
 ) -> list[Photo]:
-    """Asynchronously scan a directory and hash supported image files.
-
-    Work is parallelized with ``anyio`` to keep UI and event loops responsive.
-    ``max_concurrency`` limits how many images are processed at once; by default
-    it scales with available CPU cores but is capped to avoid overwhelming I/O.
-    """
+    """Asynchronously scan a directory and hash supported image files."""
 
     if not directory.exists():
         raise FileNotFoundError(directory)
@@ -51,20 +51,20 @@ async def scan_directory_async(
         return []
 
     concurrency = max_concurrency or min(16, (os.cpu_count() or 4) * 2)
-    results: dict[int, Photo] = {}
+    photos: list[Photo] = []
+    semaphore = anyio.Semaphore(concurrency)
     async with anyio.create_task_group() as tg:
-        semaphore = anyio.Semaphore(concurrency)
-        for idx, path in enumerate(paths):
+        for path in paths:
             tg.start_soon(
-                _process_path,
-                idx,
+                _append_photo,
                 path,
                 semaphore,
-                results,
+                photos,
                 ignore_errors,
             )
 
-    return [results[i] for i in range(len(paths)) if i in results]
+    photos.sort(key=_grouping_sort_key)
+    return photos
 
 
 def _collect_paths(directory: Path, recursive: bool) -> list[Path]:
@@ -103,13 +103,24 @@ def _resolve_taken_time(image: Image.Image, path: Path) -> datetime:
     return datetime.fromtimestamp(timestamp)  # noqa: DTZ006
 
 
-async def _process_path(
-    index: int,
+def _grouping_sort_key(photo: Photo) -> tuple[datetime, str]:
+    return (photo.taken_time, photo.path.name)
+
+
+async def _append_photo(
     path: Path,
     semaphore: anyio.Semaphore,
-    results: dict[int, Photo],
+    photos: list[Photo],
     ignore_errors: bool,
 ) -> None:
+    photo = await _load_photo(path, semaphore, ignore_errors)
+    if photo is not None:
+        photos.append(photo)
+
+
+async def _load_photo(
+    path: Path, semaphore: anyio.Semaphore, ignore_errors: bool
+) -> Photo | None:
     async with semaphore:
         try:
             image = await load_image_for_path_async(path)
@@ -119,12 +130,255 @@ async def _process_path(
             if not ignore_errors:
                 raise
             logger.warning("Skipping %s: %s", path, exc)
-            return
+            return None
 
-        results[index] = Photo(
+        return Photo(
             path=path,
             image=image,
             taken_time=taken_time,
             hash_hex=hash_hex,
             format=path.suffix.upper().lstrip("."),
         )
+
+
+class TimeCluster:
+    """Maintains photos that are close in capture time."""
+
+    def __init__(self, photo: Photo) -> None:
+        self.photos: list[Photo] = [photo]
+        self.start = photo.taken_time
+        self.end = photo.taken_time
+
+    def add_photo(self, photo: Photo) -> None:
+        self.photos.append(photo)
+        self.photos.sort(key=_grouping_sort_key)
+        self.start = min(self.start, photo.taken_time)
+        self.end = max(self.end, photo.taken_time)
+
+    def merge(self, other: TimeCluster) -> None:
+        self.photos.extend(other.photos)
+        self.photos.sort(key=_grouping_sort_key)
+        self.start = min(self.start, other.start)
+        self.end = max(self.end, other.end)
+
+
+class HashCluster:
+    """Maintains photos that are similar by perceptual hash."""
+
+    def __init__(self, photo: Photo) -> None:
+        self.photos: list[Photo] = [photo]
+
+    def add_photo(self, photo: Photo) -> None:
+        self.photos.append(photo)
+
+    def merge(self, other: HashCluster) -> None:
+        self.photos.extend(other.photos)
+
+    def distance_to(self, photo: Photo) -> int:
+        return min(
+            hamming_distance(member.hash_hex, photo.hash_hex) for member in self.photos
+        )
+
+
+class StreamingBurstGrouper:
+    """Stream photos while grouping incrementally by time and pHash."""
+
+    def __init__(
+        self,
+        *,
+        time_gap_seconds: float = 2.0,
+        hash_threshold: int = 5,
+        min_group_size: int = 2,
+        batch_size: int = 32,
+    ) -> None:
+        self.time_gap_seconds = time_gap_seconds
+        self.hash_threshold = hash_threshold
+        self.min_group_size = min_group_size
+        self.batch_size = batch_size
+        self.photos: list[Photo] = []
+        self._pending: list[Photo] = []
+        self._time_clusters: list[TimeCluster] = []
+        self._hash_clusters: list[HashCluster] = []
+        self._hash_membership: dict[Path, HashCluster] = {}
+
+    async def iter_groups(
+        self,
+        directory: Path,
+        *,
+        recursive: bool = True,
+        ignore_errors: bool = True,
+        max_concurrency: int | None = None,
+    ) -> AsyncIterator[GroupingResult]:
+        """Yield grouping snapshots as photos are loaded and hashed."""
+
+        if not directory.exists():
+            raise FileNotFoundError(directory)
+
+        paths = _collect_paths(directory, recursive)
+        if not paths:
+            yield GroupingResult(photos=[], groups=[], done=True)
+            return
+
+        send, receive = anyio.create_memory_object_stream(self.batch_size * 4)
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                self._produce_photos,
+                paths,
+                send,
+                ignore_errors,
+                max_concurrency,
+            )
+
+            async with receive:
+                async for photo in receive:
+                    self._pending.append(photo)
+                    if len(self._pending) >= self.batch_size:
+                        snapshot = self._flush_pending()
+                        if snapshot:
+                            yield snapshot
+
+        final_snapshot = self._flush_pending()
+        if final_snapshot:
+            final_snapshot.done = True
+            yield final_snapshot
+            return
+        yield self._snapshot(done=True)
+
+    async def _produce_photos(
+        self,
+        paths: list[Path],
+        send: ObjectSendStream[Photo],
+        ignore_errors: bool,
+        max_concurrency: int | None,
+    ) -> None:
+        concurrency = max_concurrency or min(16, (os.cpu_count() or 4) * 2)
+        semaphore = anyio.Semaphore(concurrency)
+
+        try:
+            async with anyio.create_task_group() as tg:
+                for path in paths:
+                    tg.start_soon(
+                        self._load_and_send,
+                        path,
+                        semaphore,
+                        ignore_errors,
+                        send,
+                    )
+        finally:
+            await send.aclose()
+
+    async def _load_and_send(
+        self,
+        path: Path,
+        semaphore: anyio.Semaphore,
+        ignore_errors: bool,
+        send: ObjectSendStream[Photo],
+    ) -> None:
+        photo = await _load_photo(path, semaphore, ignore_errors)
+        if photo is not None:
+            await send.send(photo)
+
+    def _flush_pending(self) -> GroupingResult | None:
+        if not self._pending:
+            return None
+
+        batch = self._pending
+        self._pending = []
+        for photo in batch:
+            self._add_photo(photo)
+
+        return self._snapshot()
+
+    def _snapshot(self, *, done: bool = False) -> GroupingResult:
+        groups = self._build_groups()
+        return GroupingResult(
+            photos=sorted(self.photos, key=_grouping_sort_key),
+            groups=groups,
+            done=done,
+        )
+
+    def _add_photo(self, photo: Photo) -> None:
+        self.photos.append(photo)
+        self._insert_into_time_clusters(photo)
+        self._insert_into_hash_clusters(photo)
+
+    def _insert_into_time_clusters(self, photo: Photo) -> None:
+        starts = [cluster.start for cluster in self._time_clusters]
+        idx = bisect_left(starts, photo.taken_time)
+        left = self._time_clusters[idx - 1] if idx > 0 else None
+        right = self._time_clusters[idx] if idx < len(self._time_clusters) else None
+
+        fits_left = (
+            left is not None
+            and (photo.taken_time - left.end).total_seconds() <= self.time_gap_seconds
+        )
+        fits_right = (
+            right is not None
+            and (right.start - photo.taken_time).total_seconds()
+            <= self.time_gap_seconds
+        )
+
+        if fits_left and fits_right:
+            assert left is not None
+            assert right is not None
+            left.add_photo(photo)
+            left.merge(right)  # Merge bridging photo into a single cluster.
+            self._time_clusters.pop(idx)
+            return
+
+        if fits_left:
+            assert left is not None
+            left.add_photo(photo)
+            return
+
+        if fits_right:
+            assert right is not None
+            right.add_photo(photo)
+            return
+
+        self._time_clusters.insert(idx, TimeCluster(photo))
+
+    def _insert_into_hash_clusters(self, photo: Photo) -> None:
+        matches: list[HashCluster] = [
+            cluster
+            for cluster in self._hash_clusters
+            if cluster.distance_to(photo) <= self.hash_threshold
+        ]
+
+        if not matches:
+            cluster = HashCluster(photo)
+            self._hash_clusters.append(cluster)
+        else:
+            cluster = matches[0]
+            cluster.add_photo(photo)
+            for extra in matches[1:]:
+                cluster.merge(extra)
+                self._hash_clusters.remove(extra)
+                for member in extra.photos:
+                    self._hash_membership[member.path] = cluster
+
+        self._hash_membership[photo.path] = cluster
+
+    def _build_groups(self) -> list[Group]:
+        groups: list[Group] = []
+        next_id = 1
+        for time_cluster in self._time_clusters:
+            buckets: dict[HashCluster, list[Photo]] = defaultdict(list)
+            for photo in sorted(time_cluster.photos, key=_grouping_sort_key):
+                hash_cluster = self._hash_membership.get(photo.path)
+                if hash_cluster is not None:
+                    buckets[hash_cluster].append(photo)
+
+            for photos in buckets.values():
+                if len(photos) < self.min_group_size:
+                    for photo in photos:
+                        photo.group_id = None
+                    continue
+
+                group = Group(id=next_id, photos=list(photos))
+                for photo in group.photos:
+                    photo.group_id = group.id
+                groups.append(group)
+                next_id += 1
+
+        return groups

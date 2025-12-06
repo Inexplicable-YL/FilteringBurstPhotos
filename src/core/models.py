@@ -1,14 +1,8 @@
-from __future__ import annotations
+from datetime import datetime
+from pathlib import Path
 
-from typing import TYPE_CHECKING
-
+from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
-
-if TYPE_CHECKING:
-    from datetime import datetime
-    from pathlib import Path
-
-    from PIL import Image
 
 
 class Photo(BaseModel):
@@ -48,3 +42,13 @@ class Group(BaseModel):
 
     def size(self) -> int:
         return len(self.photos)
+
+
+class GroupingResult(BaseModel):
+    """Snapshot returned by the streaming grouping pipeline."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    photos: list[Photo] = Field(default_factory=list)
+    groups: list[Group] = Field(default_factory=list)
+    done: bool = False
