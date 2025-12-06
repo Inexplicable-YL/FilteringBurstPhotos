@@ -30,23 +30,6 @@ SUPPORTED_EXTENSIONS: set[str] = _discover_supported_extensions()
 EXIF_DATETIME_KEYS = {k: v for k, v in ExifTags.TAGS.items() if v == "DateTime"}
 
 
-def scan_directory(
-    directory: Path,
-    recursive: bool = True,
-    ignore_errors: bool = True,
-    max_concurrency: int | None = None,
-) -> list[Photo]:
-    """Synchronous wrapper for :func:`scan_directory_async`."""
-
-    return anyio.run(
-        scan_directory_async,
-        directory,
-        recursive,
-        ignore_errors,
-        max_concurrency,
-    )
-
-
 async def scan_directory_async(
     directory: Path,
     recursive: bool = True,

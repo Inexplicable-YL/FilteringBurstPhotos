@@ -47,9 +47,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src._count_time import timer
 from core.grouping import group_bursts
 from core.image_scan import scan_directory_async
+from src._count_time import timer
 from ui.image_utils import pil_to_qpixmap, scale_pixmap
 
 if TYPE_CHECKING:
