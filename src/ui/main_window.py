@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 from _count_time import timer
-from core.image_scan import StreamingBurstGrouper
+from core.image_group import StreamingBurstGrouper
 from ui.image_utils import pil_to_qpixmap, scale_pixmap
 
 if TYPE_CHECKING:
