@@ -67,6 +67,7 @@ class ScanWorker(QObject):
     """Background scanner using anyio threads to keep UI responsive."""
 
     finished = Signal(list, list)
+    progress = Signal(list, list, bool)
     failed = Signal(str)
 
     def __init__(self, directory: Path, settings: Settings) -> None:
@@ -99,6 +100,7 @@ class ScanWorker(QObject):
                 recursive=self.settings.scan_recursive,
             ):
                 last_snapshot = snapshot
+                self.progress.emit(snapshot.photos, snapshot.groups, snapshot.done)
 
         if last_snapshot is None:
             return [], []
@@ -127,6 +129,7 @@ class MainWindow(QMainWindow):
         self._last_preview_photo: Photo | None = None
         self._group_widgets: list[GroupWidget] = []
         self._scan_worker: ScanWorker | None = None
+        self._streaming_updates = False
         self._photo_lookup: dict[Path, Photo] = {}
         self._background_timer = QTimer(self)
         self._background_timer.setSingleShot(True)
@@ -239,28 +242,32 @@ class MainWindow(QMainWindow):
             return
 
         self.status_bar.showMessage(f"扫描: {directory}")
+        self._streaming_updates = False
+        self._selected_paths.clear()
+        self._last_preview_photo = None
+        self._base_pixmap_cache.clear()
+        self._thumbnail_cache.clear()
+        self._reset_preview()
+        self._set_action_buttons_enabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self._scan_worker = ScanWorker(directory, self.settings)
         self._scan_worker.finished.connect(self._on_scan_finished)
+        self._scan_worker.progress.connect(self._on_scan_progress)
         self._scan_worker.failed.connect(self._on_scan_failed)
         self._scan_worker.start()
 
     def _on_scan_finished(self, photos: list[Photo], groups: list[Group]) -> None:
         QApplication.restoreOverrideCursor()
-        self.photos = photos
-        self.groups = groups
-        self._photo_lookup = {photo.path: photo for photo in photos}
-        self._last_preview_photo = None
         self.current_directory = (
             self._scan_worker.directory if self._scan_worker else self.current_directory
         )
         self._scan_worker = None
-        self._base_pixmap_cache.clear()
-        self._thumbnail_cache.clear()
-        self._populate_groups()
-        self.status_bar.showMessage(
-            f"找到 {len(self.photos)} 张照片，{len(self.groups)} 个连拍组", 5000
-        )
+        if not self._streaming_updates:
+            self._apply_snapshot(photos, groups, reset_selection=True, done=True)
+        else:
+            self.status_bar.showMessage(
+                f"找到 {len(self.photos)} 张照片，{len(self.groups)} 个连拍组", 5000
+            )
 
     def _on_scan_failed(self, error: str) -> None:
         QApplication.restoreOverrideCursor()
@@ -268,12 +275,51 @@ class MainWindow(QMainWindow):
         logger.error("Scan failed: %s", error)
         QMessageBox.critical(self, "扫描失败", error)
 
-    def _populate_groups(self) -> None:
+    def _on_scan_progress(
+        self, photos: list[Photo], groups: list[Group], done: bool
+    ) -> None:
+        self._streaming_updates = True
+        self._apply_snapshot(photos, groups, reset_selection=False, done=done)
+
+    def _apply_snapshot(
+        self,
+        photos: list[Photo],
+        groups: list[Group],
+        *,
+        reset_selection: bool,
+        done: bool,
+    ) -> None:
+        self.photos = photos
+        self.groups = groups
+        self._photo_lookup = {photo.path: photo for photo in photos}
+
+        available_paths = {photo.path for photo in photos}
+        if reset_selection:
+            self._selected_paths.clear()
+            self._last_preview_photo = None
+        else:
+            self._selected_paths.intersection_update(available_paths)
+            if self._last_preview_photo and (
+                self._last_preview_photo.path not in available_paths
+            ):
+                self._last_preview_photo = None
+
+        self._populate_groups(reset_selection=reset_selection)
+
+        if self._last_preview_photo:
+            self._update_preview(self._last_preview_photo)
+        elif reset_selection or not self.groups:
+            self._reset_preview()
+
+        self._set_action_buttons_enabled(bool(self._selected_paths))
+        message = f"已加载 {len(self.photos)} 张照片，{len(self.groups)} 个连拍组"
+        self.status_bar.showMessage(message, 4000 if done else 1500)
+
+    def _populate_groups(self, *, reset_selection: bool = True) -> None:
         self._clear_layout(self.group_layout)
         self._group_widgets.clear()
-        self._selected_paths.clear()
-        self._reset_preview()
-        self._set_action_buttons_enabled(False)
+        if reset_selection:
+            self._selected_paths.clear()
 
         if not self.groups:
             placeholder = QLabel("未找到连拍组")
@@ -282,16 +328,18 @@ class MainWindow(QMainWindow):
             self.group_layout.addWidget(placeholder)
             return
 
-        with timer("Populate Groups"):
-            for group in self.groups:
-                widget = GroupWidget(
-                    group=group,
-                    thumbnail_size=self.thumbnail_size,
-                    thumbnail_loader=self._load_thumbnail,
-                    on_photo_clicked=self._on_photo_clicked,
-                )
-                self._group_widgets.append(widget)
-                self.group_layout.addWidget(widget)
+        for group in self.groups:
+            widget = GroupWidget(
+                group=group,
+                thumbnail_size=self.thumbnail_size,
+                thumbnail_loader=self._load_thumbnail,
+                on_photo_clicked=self._on_photo_clicked,
+            )
+            for thumb in widget.thumbnails:
+                if thumb.photo.path in self._selected_paths:
+                    thumb.set_selected(True)
+            self._group_widgets.append(widget)
+            self.group_layout.addWidget(widget)
 
         self.group_layout.addStretch()
         self._load_visible_thumbnails()
@@ -399,7 +447,10 @@ class MainWindow(QMainWindow):
         self.groups = new_groups
         self.photos = kept_photos
         self._photo_lookup = {photo.path: photo for photo in kept_photos}
-        self._populate_groups()
+        self._selected_paths.clear()
+        self._populate_groups(reset_selection=True)
+        self._reset_preview()
+        self._set_action_buttons_enabled(False)
         self.status_bar.showMessage("已保存选择，未选中的照片已移除显示", 4000)
 
     def _clear_layout(self, layout: QLayout) -> None:

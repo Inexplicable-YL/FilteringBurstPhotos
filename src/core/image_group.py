@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 from bisect import bisect_left
-from collections import defaultdict
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -162,22 +161,23 @@ class TimeCluster:
         self.end = max(self.end, other.end)
 
 
-class HashCluster:
-    """Maintains photos that are similar by perceptual hash."""
+def _cluster_by_hash(photos: list[Photo], threshold: int) -> list[list[Photo]]:
+    """Split photos into hash-similar buckets using an anchor-based scan."""
 
-    def __init__(self, photo: Photo) -> None:
-        self.photos: list[Photo] = [photo]
+    buckets: list[tuple[str, list[Photo]]] = []
+    for photo in photos:
+        target = None
+        for anchor_hash, bucket in buckets:
+            if hamming_distance(anchor_hash, photo.hash_hex) <= threshold:
+                target = bucket
+                break
 
-    def add_photo(self, photo: Photo) -> None:
-        self.photos.append(photo)
+        if target is None:
+            buckets.append((photo.hash_hex, [photo]))
+        else:
+            target.append(photo)
 
-    def merge(self, other: HashCluster) -> None:
-        self.photos.extend(other.photos)
-
-    def distance_to(self, photo: Photo) -> int:
-        return min(
-            hamming_distance(member.hash_hex, photo.hash_hex) for member in self.photos
-        )
+    return [bucket for _, bucket in buckets]
 
 
 class StreamingBurstGrouper:
@@ -198,8 +198,6 @@ class StreamingBurstGrouper:
         self.photos: list[Photo] = []
         self._pending: list[Photo] = []
         self._time_clusters: list[TimeCluster] = []
-        self._hash_clusters: list[HashCluster] = []
-        self._hash_membership: dict[Path, HashCluster] = {}
 
     async def iter_groups(
         self,
@@ -300,7 +298,6 @@ class StreamingBurstGrouper:
     def _add_photo(self, photo: Photo) -> None:
         self.photos.append(photo)
         self._insert_into_time_clusters(photo)
-        self._insert_into_hash_clusters(photo)
 
     def _insert_into_time_clusters(self, photo: Photo) -> None:
         starts = [cluster.start for cluster in self._time_clusters]
@@ -338,38 +335,14 @@ class StreamingBurstGrouper:
 
         self._time_clusters.insert(idx, TimeCluster(photo))
 
-    def _insert_into_hash_clusters(self, photo: Photo) -> None:
-        matches: list[HashCluster] = [
-            cluster
-            for cluster in self._hash_clusters
-            if cluster.distance_to(photo) <= self.hash_threshold
-        ]
-
-        if not matches:
-            cluster = HashCluster(photo)
-            self._hash_clusters.append(cluster)
-        else:
-            cluster = matches[0]
-            cluster.add_photo(photo)
-            for extra in matches[1:]:
-                cluster.merge(extra)
-                self._hash_clusters.remove(extra)
-                for member in extra.photos:
-                    self._hash_membership[member.path] = cluster
-
-        self._hash_membership[photo.path] = cluster
-
     def _build_groups(self) -> list[Group]:
         groups: list[Group] = []
         next_id = 1
         for time_cluster in self._time_clusters:
-            buckets: dict[HashCluster, list[Photo]] = defaultdict(list)
-            for photo in sorted(time_cluster.photos, key=_grouping_sort_key):
-                hash_cluster = self._hash_membership.get(photo.path)
-                if hash_cluster is not None:
-                    buckets[hash_cluster].append(photo)
-
-            for photos in buckets.values():
+            for photos in _cluster_by_hash(
+                sorted(time_cluster.photos, key=_grouping_sort_key),
+                self.hash_threshold,
+            ):
                 if len(photos) < self.min_group_size:
                     for photo in photos:
                         photo.group_id = None
