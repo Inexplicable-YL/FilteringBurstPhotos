@@ -19,51 +19,16 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from anyio.abc import ObjectSendStream
+
+
 logger = logging.getLogger(__name__)
 
 
-def _discover_supported_extensions() -> set[str]:
-    """Return a normalized set of file extensions supported by the scanner."""
-
-    pil_extensions = {ext.lower() for ext in Image.registered_extensions()}
-    return pil_extensions | {ext.lower() for ext in RAW_EXTENSIONS}
-
-
-SUPPORTED_EXTENSIONS: set[str] = _discover_supported_extensions()
+SUPPORTED_EXTENSIONS: set[str] = {
+    ext.lower() for ext in Image.registered_extensions()
+} | {ext.lower() for ext in RAW_EXTENSIONS}
 
 EXIF_DATETIME_KEYS = {k: v for k, v in ExifTags.TAGS.items() if v == "DateTime"}
-
-
-async def scan_directory_async(
-    directory: Path,
-    recursive: bool = True,
-    ignore_errors: bool = True,
-    max_concurrency: int | None = None,
-) -> list[Photo]:
-    """Asynchronously scan a directory and hash supported image files."""
-
-    if not directory.exists():
-        raise FileNotFoundError(directory)
-
-    paths = _collect_paths(directory, recursive)
-    if not paths:
-        return []
-
-    concurrency = max_concurrency or min(16, (os.cpu_count() or 4) * 2)
-    photos: list[Photo] = []
-    semaphore = anyio.Semaphore(concurrency)
-    async with anyio.create_task_group() as tg:
-        for path in paths:
-            tg.start_soon(
-                _append_photo,
-                path,
-                semaphore,
-                photos,
-                ignore_errors,
-            )
-
-    photos.sort(key=_grouping_sort_key)
-    return photos
 
 
 def _collect_paths(directory: Path, recursive: bool) -> list[Path]:
@@ -104,17 +69,6 @@ def _resolve_taken_time(image: Image.Image, path: Path) -> datetime:
 
 def _grouping_sort_key(photo: Photo) -> tuple[datetime, str]:
     return (photo.taken_time, photo.path.name)
-
-
-async def _append_photo(
-    path: Path,
-    semaphore: anyio.Semaphore,
-    photos: list[Photo],
-    ignore_errors: bool,
-) -> None:
-    photo = await _load_photo(path, semaphore, ignore_errors)
-    if photo is not None:
-        photos.append(photo)
 
 
 async def _load_photo(
@@ -159,25 +113,6 @@ class TimeCluster:
         self.photos.sort(key=_grouping_sort_key)
         self.start = min(self.start, other.start)
         self.end = max(self.end, other.end)
-
-
-def _cluster_by_hash(photos: list[Photo], threshold: int) -> list[list[Photo]]:
-    """Split photos into hash-similar buckets using an anchor-based scan."""
-
-    buckets: list[tuple[str, list[Photo]]] = []
-    for photo in photos:
-        target = None
-        for anchor_hash, bucket in buckets:
-            if hamming_distance(anchor_hash, photo.hash_hex) <= threshold:
-                target = bucket
-                break
-
-        if target is None:
-            buckets.append((photo.hash_hex, [photo]))
-        else:
-            target.append(photo)
-
-    return [bucket for _, bucket in buckets]
 
 
 class StreamingBurstGrouper:
@@ -335,11 +270,31 @@ class StreamingBurstGrouper:
 
         self._time_clusters.insert(idx, TimeCluster(photo))
 
+    def _cluster_by_hash(
+        self, photos: list[Photo], threshold: int
+    ) -> list[list[Photo]]:
+        """Split photos into hash-similar buckets using an anchor-based scan."""
+
+        buckets: list[tuple[str, list[Photo]]] = []
+        for photo in photos:
+            target = None
+            for anchor_hash, bucket in buckets:
+                if hamming_distance(anchor_hash, photo.hash_hex) <= threshold:
+                    target = bucket
+                    break
+
+            if target is None:
+                buckets.append((photo.hash_hex, [photo]))
+            else:
+                target.append(photo)
+
+        return [bucket for _, bucket in buckets]
+
     def _build_groups(self) -> list[Group]:
         groups: list[Group] = []
         next_id = 1
         for time_cluster in self._time_clusters:
-            for photos in _cluster_by_hash(
+            for photos in self._cluster_by_hash(
                 sorted(time_cluster.photos, key=_grouping_sort_key),
                 self.hash_threshold,
             ):
