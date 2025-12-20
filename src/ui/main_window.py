@@ -1,44 +1,22 @@
 from __future__ import annotations
 
 import logging
-import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from typing_extensions import override
 
-import anyio
-from PySide6.QtCore import (
-    QCoreApplication,
-    QObject,
-    QPoint,
-    QRect,
-    QSize,
-    Qt,
-    QTimer,
-    Signal,
-)
-from PySide6.QtGui import (
-    QAction,
-    QIcon,
-    QMouseEvent,
-    QPainter,
-    QPaintEvent,
-    QPen,
-    QPixmap,
-    QResizeEvent,
-    QWheelEvent,
-)
+from PySide6.QtCore import QCoreApplication, QRect, QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QIcon, QPixmap, QResizeEvent, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QLayout,
-    QLayoutItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QScrollArea,
+    QSizePolicy,
     QSplitter,
     QStatusBar,
     QToolBar,
@@ -46,65 +24,32 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from _count_time import timer
-from core.image_group import StreamingBurstGrouper
-from ui.image_utils import pil_to_qpixmap, scale_pixmap
+from ui.constants import (
+    ACCENT_COLOR,
+    BORDER_COLOR,
+    CANVAS_BG,
+    INITIAL_THUMBNAIL_SIZE,
+    MUTED_TEXT,
+    PRIMARY_TEXT,
+    SURFACE_BG,
+    THUMBNAIL_MAX_SIZE,
+    THUMBNAIL_MIN_SIZE,
+)
+from ui.pixmap_cache import PixmapCache
+from ui.scan_worker import ScanWorker
+from ui.widgets import (
+    GroupWidget,
+    LeftContainer,
+    PhotoThumbnail,
+    PreviewLabel,
+    ThumbnailScrollArea,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from config.settings import Settings
     from core.models import Group, Photo
 
 logger = logging.getLogger(__name__)
-
-THUMBNAIL_MIN_SIZE = 48
-THUMBNAIL_MAX_SIZE = 220
-INITIAL_THUMBNAIL_SIZE = 140
-
-
-class ScanWorker(QObject):
-    """Background scanner using anyio threads to keep UI responsive."""
-
-    finished = Signal(list, list)
-    progress = Signal(list, list, bool)
-    failed = Signal(str)
-
-    def __init__(self, directory: Path, settings: Settings) -> None:
-        super().__init__()
-        self.directory = directory
-        self.settings = settings
-
-    def start(self) -> None:
-        thread = threading.Thread(target=self._run, daemon=True)
-        thread.start()
-
-    def _run(self) -> None:
-        try:
-            photos, groups = anyio.run(self._scan_and_group)
-            self.finished.emit(photos, groups)
-        except Exception as exc:  # pragma: no cover - background thread safety
-            logger.exception("Failed during scan")
-            self.failed.emit(str(exc))
-
-    async def _scan_and_group(self) -> tuple[list[Photo], list[Group]]:
-        grouper = StreamingBurstGrouper(
-            time_gap_seconds=2.0,
-            hash_threshold=self.settings.hash_threshold,
-            min_group_size=self.settings.min_group_size,
-        )
-        last_snapshot = None
-        with timer("Scan Directory"):
-            async for snapshot in grouper.iter_groups(
-                self.directory,
-                recursive=self.settings.scan_recursive,
-            ):
-                last_snapshot = snapshot
-                self.progress.emit(snapshot.photos, snapshot.groups, snapshot.done)
-
-        if last_snapshot is None:
-            return [], []
-        return last_snapshot.photos, last_snapshot.groups
 
 
 class MainWindow(QMainWindow):
@@ -122,8 +67,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Filtering Burst Photos")
         self.resize(1280, 860)
 
-        self._base_pixmap_cache: dict[Path, QPixmap] = {}
-        self._thumbnail_cache: dict[tuple[Path, int], QPixmap] = {}
+        self._pixmap_cache = PixmapCache()
         self.thumbnail_size = INITIAL_THUMBNAIL_SIZE
         self._selected_paths: set[Path] = set()
         self._last_preview_photo: Photo | None = None
@@ -134,15 +78,23 @@ class MainWindow(QMainWindow):
         self._background_timer = QTimer(self)
         self._background_timer.setSingleShot(True)
         self._background_timer.timeout.connect(self._background_load_step)
+        self._snapshot_timer = QTimer(self)
+        self._snapshot_timer.setSingleShot(True)
+        self._snapshot_timer.timeout.connect(self._drain_pending_snapshot)
+        self._pending_snapshot: tuple[list[Photo], list[Group], bool] | None = None
+        self._thumb_resize_timer = QTimer(self)
+        self._thumb_resize_timer.setSingleShot(True)
+        self._thumb_resize_timer.timeout.connect(self._apply_pending_thumbnail_size)
+        self._pending_thumbnail_size: int | None = None
 
         self.toolbar = self._build_toolbar()
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
         self.thumbnail_container = QWidget()
-        self.thumbnail_container.setStyleSheet("background: black;")
+        self.thumbnail_container.setObjectName("thumbnailContainer")
         self.group_layout = QVBoxLayout()
-        self.group_layout.setContentsMargins(12, 12, 12, 12)
+        self.group_layout.setContentsMargins(14, 14, 14, 14)
         self.group_layout.setSpacing(16)
         self.thumbnail_container.setLayout(self.group_layout)
 
@@ -158,6 +110,7 @@ class MainWindow(QMainWindow):
         )
 
         self.cancel_button = QPushButton("取消")
+        self.cancel_button.setObjectName("ghostButton")
         self.save_button = QPushButton("保存")
         self.cancel_button.clicked.connect(self._cancel_selection)
         self.save_button.clicked.connect(self._save_selection)
@@ -169,7 +122,7 @@ class MainWindow(QMainWindow):
         buttons_layout.addWidget(self.save_button)
         buttons_container = QWidget()
         buttons_container.setLayout(buttons_layout)
-        buttons_container.setStyleSheet("background: black; padding: 8px;")
+        buttons_container.setObjectName("actionsBar")
 
         left_layout = QVBoxLayout()
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -181,8 +134,12 @@ class MainWindow(QMainWindow):
         left_container.ctrl_scroll.connect(self._update_thumbnail_size)
 
         self.preview_label = PreviewLabel("选择一张照片查看预览")
+        self.preview_label.setObjectName("previewArea")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setStyleSheet("background: #111; color: #ccc;")
+        self.preview_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
+        )
+        self.preview_label.setScaledContents(False)
         self.preview_label.size_changed.connect(
             lambda _: self._update_preview(self._last_preview_photo)
         )
@@ -194,13 +151,125 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
 
         self.setCentralWidget(splitter)
+        self._apply_theme()
 
         if initial_directory:
             self.load_directory(initial_directory)
 
+    def _apply_theme(self) -> None:
+        self.setStyleSheet(
+            f"""
+            QMainWindow {{
+                background: {CANVAS_BG};
+                color: {PRIMARY_TEXT};
+                font-family: 'Segoe UI Variable', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+            }}
+            QLabel {{
+                color: {PRIMARY_TEXT};
+            }}
+            QWidget#thumbnailContainer {{
+                background: qlineargradient(
+                    x1 0 y1 0, x2 0 y2 1,
+                    stop: 0 #101625,
+                    stop: 1 #0a0f18
+                );
+            }}
+            QWidget#actionsBar {{
+                background: rgba(12, 16, 24, 0.9);
+                border-top: 1px solid {BORDER_COLOR};
+                padding: 8px 12px;
+            }}
+            QLabel#previewArea {{
+                background: qlineargradient(
+                    x1 0 y1 0, x2 1 y2 1,
+                    stop: 0 {SURFACE_BG},
+                    stop: 1 #0f1523
+                );
+                color: {PRIMARY_TEXT};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 12px;
+                padding: 18px;
+            }}
+            QToolBar {{
+                background: {SURFACE_BG};
+                border: none;
+                padding: 8px 12px;
+                spacing: 8px;
+            }}
+            QToolButton {{
+                color: {PRIMARY_TEXT};
+                padding: 6px 10px;
+                border-radius: 8px;
+            }}
+            QToolButton:hover {{
+                background: {BORDER_COLOR};
+            }}
+            QPushButton {{
+                background: {ACCENT_COLOR};
+                color: #0d1117;
+                border-radius: 10px;
+                padding: 10px 16px;
+                font-weight: 600;
+                border: none;
+            }}
+            QPushButton:hover:!disabled {{
+                background: #55d8b3;
+            }}
+            QPushButton:pressed {{
+                background: #34c499;
+            }}
+            QPushButton:disabled {{
+                background: {BORDER_COLOR};
+                color: {MUTED_TEXT};
+            }}
+            QPushButton#ghostButton {{
+                background: transparent;
+                color: {PRIMARY_TEXT};
+                border: 1px solid {BORDER_COLOR};
+            }}
+            QPushButton#ghostButton:hover:!disabled {{
+                border-color: {ACCENT_COLOR};
+                color: {ACCENT_COLOR};
+            }}
+            QScrollArea {{
+                background: transparent;
+                border: none;
+            }}
+            QStatusBar {{
+                background: {SURFACE_BG};
+                color: {MUTED_TEXT};
+                border-top: 1px solid {BORDER_COLOR};
+            }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 12px;
+                margin: 6px 0 6px 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {BORDER_COLOR};
+                border-radius: 6px;
+                min-height: 24px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: {ACCENT_COLOR};
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+            QLabel.photoName {{
+                color: {PRIMARY_TEXT};
+            }}
+            QLabel.photoMeta {{
+                color: {MUTED_TEXT};
+            }}
+            """
+        )
+
     def _build_toolbar(self) -> QToolBar:
         toolbar = QToolBar("Main")
         toolbar.setMovable(False)
+        toolbar.setIconSize(QSize(18, 18))
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
 
         open_action = QAction(QIcon.fromTheme("folder-open"), "打开目录", self)
         open_action.triggered.connect(self._pick_directory)
@@ -243,10 +312,12 @@ class MainWindow(QMainWindow):
 
         self.status_bar.showMessage(f"扫描: {directory}")
         self._streaming_updates = False
+        self._pending_snapshot = None
+        self._snapshot_timer.stop()
+        self._background_timer.stop()
         self._selected_paths.clear()
         self._last_preview_photo = None
-        self._base_pixmap_cache.clear()
-        self._thumbnail_cache.clear()
+        self._pixmap_cache.clear_all()
         self._reset_preview()
         self._set_action_buttons_enabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -255,6 +326,25 @@ class MainWindow(QMainWindow):
         self._scan_worker.progress.connect(self._on_scan_progress)
         self._scan_worker.failed.connect(self._on_scan_failed)
         self._scan_worker.start()
+
+    def _queue_snapshot(
+        self,
+        photos: list[Photo],
+        groups: list[Group],
+        done: bool,
+        *,
+        force_now: bool = False,
+    ) -> None:
+        self._pending_snapshot = (photos, groups, done)
+        self._snapshot_timer.stop()
+        self._snapshot_timer.start(0 if force_now else 90)
+
+    def _drain_pending_snapshot(self) -> None:
+        if not self._pending_snapshot:
+            return
+        photos, groups, done = self._pending_snapshot
+        self._pending_snapshot = None
+        self._apply_snapshot(photos, groups, reset_selection=False, done=done)
 
     def _on_scan_finished(self, photos: list[Photo], groups: list[Group]) -> None:
         QApplication.restoreOverrideCursor()
@@ -265,13 +355,16 @@ class MainWindow(QMainWindow):
         if not self._streaming_updates:
             self._apply_snapshot(photos, groups, reset_selection=True, done=True)
         else:
+            self._queue_snapshot(photos, groups, True, force_now=True)
             self.status_bar.showMessage(
-                f"找到 {len(self.photos)} 张照片，{len(self.groups)} 个连拍组", 5000
+                f"找到 {len(photos)} 张照片，{len(groups)} 个连拍组", 5000
             )
 
     def _on_scan_failed(self, error: str) -> None:
         QApplication.restoreOverrideCursor()
         self._scan_worker = None
+        self._pending_snapshot = None
+        self._snapshot_timer.stop()
         logger.error("Scan failed: %s", error)
         QMessageBox.critical(self, "扫描失败", error)
 
@@ -279,7 +372,7 @@ class MainWindow(QMainWindow):
         self, photos: list[Photo], groups: list[Group], done: bool
     ) -> None:
         self._streaming_updates = True
-        self._apply_snapshot(photos, groups, reset_selection=False, done=done)
+        self._queue_snapshot(photos, groups, done)
 
     def _apply_snapshot(
         self,
@@ -323,7 +416,10 @@ class MainWindow(QMainWindow):
 
         if not self.groups:
             placeholder = QLabel("未找到连拍组")
-            placeholder.setStyleSheet("color: #999; background: black;")
+            placeholder.setStyleSheet(
+                f"color: {MUTED_TEXT}; background: transparent; padding: 18px;"
+                f"border: 1px dashed {BORDER_COLOR}; border-radius: 12px;"
+            )
             placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.group_layout.addWidget(placeholder)
             return
@@ -346,30 +442,10 @@ class MainWindow(QMainWindow):
         self._schedule_background_loading(240)
 
     def _get_base_pixmap(self, photo: Photo) -> QPixmap:
-        cached = self._base_pixmap_cache.get(photo.path)
-        if cached:
-            return cached
-
-        try:
-            pixmap = pil_to_qpixmap(photo.image)
-        except RuntimeError as exc:
-            logger.warning("Unable to load image for %s: %s", photo.path, exc)
-            pixmap = QPixmap(self.thumbnail_size, self.thumbnail_size)
-            pixmap.fill(Qt.GlobalColor.darkGray)
-
-        self._base_pixmap_cache[photo.path] = pixmap
-        return pixmap
+        return self._pixmap_cache.get_base_pixmap(photo)
 
     def _load_thumbnail(self, photo: Photo) -> QPixmap:
-        key = (photo.path, self.thumbnail_size)
-        cached = self._thumbnail_cache.get(key)
-        if cached:
-            return cached
-
-        scaled = scale_pixmap(self._get_base_pixmap(photo), self.thumbnail_size)
-        photo.image.close()
-        self._thumbnail_cache[key] = scaled
-        return scaled
+        return self._pixmap_cache.load_thumbnail(photo, self.thumbnail_size)
 
     def _on_photo_clicked(self, photo: Photo, selected: bool) -> None:
         if selected:
@@ -392,9 +468,11 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            target_size = self.preview_label.contentsRect().size()
+            if target_size.width() <= 0 or target_size.height() <= 0:
+                return
             scaled = self._get_base_pixmap(photo).scaled(
-                self.preview_label.width(),
-                self.preview_label.height(),
+                target_size,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
@@ -411,11 +489,8 @@ class MainWindow(QMainWindow):
         self._last_preview_photo = None
 
     def _set_action_buttons_enabled(self, enabled: bool) -> None:
-        style = "background-color: #444; color: #999;" if not enabled else ""
         self.cancel_button.setEnabled(enabled)
         self.save_button.setEnabled(enabled)
-        self.cancel_button.setStyleSheet(style)
-        self.save_button.setStyleSheet(style)
 
     def _cancel_selection(self) -> None:
         if not self._selected_paths:
@@ -475,12 +550,20 @@ class MainWindow(QMainWindow):
                     min(THUMBNAIL_MAX_SIZE, self.thumbnail_size + delta * 12),
                 )
             )
-            if new_size != self.thumbnail_size:
-                self.thumbnail_size = new_size
-            self._refresh_thumbnail_sizes()
+            if new_size == self.thumbnail_size:
+                return
+            self._pending_thumbnail_size = new_size
+            self._thumb_resize_timer.start(60)
+
+    def _apply_pending_thumbnail_size(self) -> None:
+        if self._pending_thumbnail_size is None:
+            return
+        self.thumbnail_size = self._pending_thumbnail_size
+        self._pending_thumbnail_size = None
+        self._refresh_thumbnail_sizes()
 
     def _refresh_thumbnail_sizes(self) -> None:
-        self._thumbnail_cache.clear()
+        self._pixmap_cache.clear_thumbnails()
         for widget in self._group_widgets:
             widget.update_thumbnail_size(self.thumbnail_size)
         self._load_visible_thumbnails()
@@ -489,7 +572,6 @@ class MainWindow(QMainWindow):
     @override
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
-        # Refresh preview size when the window changes.
         if self._last_preview_photo:
             self._update_preview(self._last_preview_photo)
         self._load_visible_thumbnails()
@@ -550,378 +632,3 @@ class MainWindow(QMainWindow):
 
         if len(candidates) > batch_size:
             self._schedule_background_loading(40)
-
-
-class LeftContainer(QWidget):
-    ctrl_scroll = Signal(QWheelEvent)
-
-    @override
-    def wheelEvent(self, event: QWheelEvent) -> None:
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            self.ctrl_scroll.emit(event)
-        else:
-            super().wheelEvent(event)
-
-
-class PreviewLabel(QLabel):
-    size_changed = Signal(QSize)
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._size_change_timer = QTimer(self)
-        self._size_change_timer.setSingleShot(True)
-        self._size_change_timer.timeout.connect(self._emit_size_changed)
-
-    @override
-    def resizeEvent(self, event: QResizeEvent) -> None:
-        super().resizeEvent(event)
-        self._size_change_timer.stop()
-        self._size_change_timer.start(100)
-
-    def _emit_size_changed(self) -> None:
-        self.size_changed.emit(self.size())
-
-
-class FlowLayout(QLayout):
-    """A simple flow layout that wraps children horizontally."""
-
-    def __init__(self, margin: int = 12, spacing: int = 8) -> None:
-        super().__init__()
-        self._items: list[QLayoutItem] = []
-        self.setContentsMargins(margin, margin, margin, margin)
-        self.setSpacing(spacing)
-
-    @override
-    def addItem(self, item: QLayoutItem) -> None:
-        self._items.append(item)
-
-    @override
-    def addWidget(self, widget: QWidget) -> None:
-        widget.setParent(self.parentWidget())
-        self.addItem(QLayoutItemWrapper(widget))
-
-    @override
-    def count(self) -> int:
-        return len(self._items)
-
-    @override
-    def itemAt(self, index: int) -> QLayoutItem | None:
-        if 0 <= index < len(self._items):
-            return self._items[index]
-        return None
-
-    @override
-    def takeAt(self, index: int) -> QLayoutItem:
-        return self._items.pop(index)
-
-    @override
-    def sizeHint(self) -> QSize:
-        width = self.parentWidget().width() if self.parentWidget() else 800
-        return QSize(width, self._height_for_width(width))
-
-    @override
-    def minimumSize(self) -> QSize:
-        width = 200
-        return QSize(width, self._height_for_width(width))
-
-    @override
-    def expandingDirections(self) -> Qt.Orientation:
-        return Qt.Orientation(0)
-
-    @override
-    def setGeometry(self, rect: QRect) -> None:
-        super().setGeometry(rect)
-        self._do_layout(rect)
-
-    def _do_layout(self, rect: QRect) -> None:
-        x = rect.x() + self.contentsMargins().left()
-        y = rect.y() + self.contentsMargins().top()
-        line_height = 0
-        spacing = self.spacing()
-        max_width = rect.width() - self.contentsMargins().right()
-
-        for item in self._items:
-            widget = item.widget()
-            if not widget:
-                continue
-            hint = widget.sizeHint()
-            next_x = x + hint.width() + spacing
-            if next_x - spacing > max_width and line_height > 0:
-                x = rect.x() + self.contentsMargins().left()
-                y = y + line_height + spacing
-                next_x = x + hint.width() + spacing
-                line_height = 0
-
-            item.setGeometry(QRect(QPoint(x, y), hint))
-            x = next_x
-            line_height = max(line_height, hint.height())
-
-    def _height_for_width(self, width: int) -> int:
-        x = self.contentsMargins().left()
-        y = self.contentsMargins().top()
-        line_height = 0
-        spacing = self.spacing()
-        max_width = width - self.contentsMargins().right()
-        for item in self._items:
-            widget = item.widget()
-            if not widget:
-                continue
-            hint = widget.sizeHint()
-            next_x = x + hint.width() + spacing
-            if next_x - spacing > max_width and line_height > 0:
-                x = self.contentsMargins().left()
-                y = y + line_height + spacing
-                next_x = x + hint.width() + spacing
-                line_height = 0
-            x = next_x
-            line_height = max(line_height, hint.height())
-        return y + line_height + self.contentsMargins().bottom()
-
-    def row_rects(self, available_width: int) -> list[QRect]:
-        rects: list[QRect] = []
-        x = self.contentsMargins().left()
-        y = self.contentsMargins().top()
-        line_height = 0
-        spacing = self.spacing()
-        max_width = available_width - self.contentsMargins().right()
-        start_x = x
-        for item in self._items:
-            widget = item.widget()
-            if not widget:
-                continue
-            w, h = widget.sizeHint().width(), widget.sizeHint().height()
-            next_x = x + w + spacing
-            if next_x - spacing > max_width and line_height > 0:
-                rects.append(
-                    QRect(
-                        start_x - 6,
-                        y - 6,
-                        (x - spacing) - start_x + 12,
-                        line_height + 12,
-                    )
-                )
-                x = self.contentsMargins().left()
-                y = y + line_height + spacing
-                line_height = 0
-                start_x = x
-                next_x = x + w + spacing
-            x = next_x
-            line_height = max(line_height, h)
-        if self._items:
-            rects.append(
-                QRect(
-                    start_x - 6, y - 6, (x - spacing) - start_x + 12, line_height + 12
-                )
-            )
-        return rects
-
-
-class QLayoutItemWrapper(QLayoutItem):
-    """Simple wrapper to let FlowLayout store widgets."""
-
-    def __init__(self, widget: QWidget) -> None:
-        super().__init__()
-        self._widget = widget
-
-    @override
-    def geometry(self) -> QRect:
-        return self._widget.geometry()
-
-    @override
-    def setGeometry(self, rect: QRect) -> None:
-        self._widget.setGeometry(rect)
-
-    @override
-    def sizeHint(self) -> QSize:
-        return self._widget.sizeHint()
-
-    @override
-    def minimumSize(self) -> QSize:
-        return self._widget.minimumSizeHint()
-
-    @override
-    def maximumSize(self) -> QSize:
-        return self._widget.maximumSize()
-
-    @override
-    def expandingDirections(self) -> Qt.Orientation:
-        return Qt.Orientation(0)
-
-    @override
-    def hasHeightForWidth(self) -> bool:
-        return self._widget.hasHeightForWidth()
-
-    @override
-    def heightForWidth(self, width: int) -> int:
-        return self._widget.heightForWidth(width)
-
-    @override
-    def widget(self) -> QWidget | None:
-        return self._widget
-
-    @override
-    def isEmpty(self) -> bool:
-        return False
-
-
-class GroupWidget(QWidget):
-    """Widget that draws a dashed group frame behind thumbnails."""
-
-    def __init__(
-        self,
-        group: Group,
-        thumbnail_size: int,
-        thumbnail_loader: Callable[[Photo], QPixmap],
-        on_photo_clicked: Callable[[Photo, bool], None],
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.group = group
-        self.thumbnail_loader: Callable[[Photo], QPixmap] = thumbnail_loader
-        self.on_photo_clicked: Callable[[Photo, bool], None] = on_photo_clicked
-
-        self.setStyleSheet("background: black;")
-        self.flow_layout = FlowLayout(margin=16, spacing=12)
-        self.setLayout(self.flow_layout)
-        self.thumbnails: list[PhotoThumbnail] = []
-        for photo in group.photos:
-            thumb = PhotoThumbnail(
-                photo, thumbnail_size, self.thumbnail_loader, self._on_thumb_clicked
-            )
-            self.thumbnails.append(thumb)
-            self.flow_layout.addWidget(thumb)
-
-    def _on_thumb_clicked(self, photo: Photo, selected: bool) -> None:
-        self.on_photo_clicked(photo, selected)
-
-    def update_thumbnail_size(self, new_size: int) -> None:
-        for thumb in self.thumbnails:
-            thumb.update_size(new_size)
-        self.updateGeometry()
-        self.update()
-        self.ensure_visible_thumbnails(self.rect())
-
-    def clear_selection(self) -> None:
-        for thumb in self.thumbnails:
-            thumb.set_selected(False)
-        self.update()
-
-    def ensure_visible_thumbnails(self, visible_rect: QRect) -> None:
-        margin = 64
-        for thumb in self.thumbnails:
-            rect = thumb.geometry().adjusted(-margin, -margin, margin, margin)
-            if rect.intersects(visible_rect):
-                thumb.ensure_loaded()
-
-    @override
-    def paintEvent(self, event: QPaintEvent) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), Qt.GlobalColor.black)
-
-        pen = QPen(Qt.GlobalColor.darkGray)
-        pen.setStyle(Qt.PenStyle.DashLine)
-        pen.setWidth(2)
-        painter.setPen(pen)
-        painter.setBrush(Qt.GlobalColor.darkGray)
-        rects = self.flow_layout.row_rects(self.width())
-        for rect in rects:
-            painter.fillRect(rect, Qt.GlobalColor.darkGray)
-            painter.drawRect(rect)
-        super().paintEvent(event)
-
-
-class PhotoThumbnail(QWidget):
-    """Thumbnail widget supporting selection and dynamic sizing."""
-
-    def __init__(
-        self,
-        photo: Photo,
-        size: int,
-        loader: Callable[[Photo], QPixmap],
-        on_clicked: Callable[[Photo, bool], None],
-    ) -> None:
-        super().__init__()
-        self.photo = photo
-        self.loader: Callable[[Photo], QPixmap] = loader
-        self.on_clicked: Callable[[Photo, bool], None] = on_clicked
-        self.is_selected = False
-        self._size_hint: QSize
-        self._needs_pixmap = True
-        self._current_size = size
-
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.text_label = QLabel(photo.path.name)
-        self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.text_label.setStyleSheet("color: white;")
-
-        layout = QVBoxLayout()
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
-        layout.addWidget(self.image_label)
-        layout.addWidget(self.text_label)
-        self.setLayout(layout)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet("background: transparent; color: white;")
-
-        self.update_size(size)
-
-    @override
-    def sizeHint(self) -> QSize:
-        return self._size_hint
-
-    @override
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.set_selected(not self.is_selected)
-            self.on_clicked(self.photo, self.is_selected)
-        super().mousePressEvent(event)
-
-    def set_selected(self, value: bool) -> None:
-        self.is_selected = value
-        border = "2px solid #4da3ff" if value else "1px solid transparent"
-        self.setStyleSheet(
-            f"background: rgba(0,0,0,0); color: white; border: {border}; border-radius: 6px;"
-        )
-
-    def update_size(self, size: int) -> None:
-        self._current_size = size
-        minimal = size < 70  # noqa: PLR2004
-        self.image_label.setVisible(not minimal)
-        if not minimal:
-            self.image_label.setFixedSize(QSize(size, size))
-        else:
-            self.image_label.clear()
-        self.text_label.setFixedWidth(size + 8)
-        font = self.text_label.font()
-        font.setPointSizeF(max(8.0, size / 14))
-        self.text_label.setFont(font)
-        self._size_hint = QSize(size + 12, (size if not minimal else 0) + 32)
-        self._needs_pixmap = True
-        self.ensure_loaded()
-        self.update()
-
-    def ensure_loaded(self) -> None:
-        if not self.should_load():
-            return
-        self._load_pixmap()
-
-    def should_load(self) -> bool:
-        return self.image_label.isVisible() and self._needs_pixmap
-
-    def _load_pixmap(self) -> None:
-        scaled = self.loader(self.photo)
-        self.image_label.setPixmap(scaled)
-        self._needs_pixmap = False
-
-
-class ThumbnailScrollArea(QScrollArea):
-    """Scroll area that forwards wheel events for zooming."""
-
-    @override
-    def wheelEvent(self, event: QWheelEvent) -> None:
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            event.ignore()
-            return
-        super().wheelEvent(event)
