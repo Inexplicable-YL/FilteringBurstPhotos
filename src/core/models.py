@@ -20,7 +20,10 @@ class Photo(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     path: Path
+
+    raw_image: Image.Image
     image: Image.Image
+
     taken_time: datetime
     hash_hex: str
     format: str
@@ -44,11 +47,10 @@ class Group(BaseModel):
         return len(self.photos)
 
 
-class GroupingResult(BaseModel):
+class PhotoResult(BaseModel):
     """Snapshot returned by the streaming grouping pipeline."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     photos: list[Photo] = Field(default_factory=list)
-    groups: list[Group] = Field(default_factory=list)
     done: bool = False

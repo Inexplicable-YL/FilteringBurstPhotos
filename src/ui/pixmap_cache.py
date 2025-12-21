@@ -42,7 +42,7 @@ class PixmapCache:
             return cached
 
         try:
-            prepared = photo.image
+            prepared = photo.raw_image
             if max(prepared.width, prepared.height) > MAX_BASE_PREVIEW_EDGE:
                 prepared = prepared.copy()
                 prepared.thumbnail(
@@ -74,7 +74,7 @@ class PixmapCache:
             scaled = scale_pixmap(preview_cached, size)
         else:
             try:
-                thumbnail_image = photo.image.copy()
+                thumbnail_image = photo.raw_image.copy()
                 thumbnail_image.thumbnail((size * 2, size * 2), RESAMPLE_MODE)
                 scaled = scale_pixmap(pil_to_qpixmap(thumbnail_image), size)
             except RuntimeError:

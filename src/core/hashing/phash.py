@@ -11,20 +11,15 @@ if TYPE_CHECKING:
 HASH_SIZE = 8
 
 
-def compute_phash(image: Image.Image) -> str:
+async def aphash(image: Image.Image) -> str:
     """Compute a perceptual hash for the given image path.
 
     The function loads the image via :func:`load_image_for_hash`, which handles
     standard formats as well as RAW files (when ``rawpy`` is available).
     """
-    phash = imagehash.phash(image, hash_size=HASH_SIZE)
+
+    phash = await to_thread.run_sync(imagehash.phash, image, HASH_SIZE)
     return phash.__str__()
-
-
-async def compute_phash_async(image: Image.Image) -> str:
-    """Asynchronously compute perceptual hash using a worker thread."""
-
-    return await to_thread.run_sync(compute_phash, image)
 
 
 def hamming_distance(hash_a: str, hash_b: str) -> int:

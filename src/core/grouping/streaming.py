@@ -3,19 +3,17 @@ from __future__ import annotations
 import logging
 import os
 from bisect import bisect_left
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 import anyio
-from anyio.to_thread import run_sync
-from PIL import ExifTags, Image
 
-from .image_hash import compute_phash_async, hamming_distance
-from .image_raw import RAW_EXTENSIONS, load_image_for_path_async
-from .models import Group, GroupingResult, Photo
+from core.hashing.phash import hamming_distance
+from core.io.loader import aload_photo, collect_paths
+from core.models import Group, GroupingResult, Photo
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+    from datetime import datetime
     from pathlib import Path
 
     from anyio.abc import ObjectSendStream
@@ -24,74 +22,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-SUPPORTED_EXTENSIONS: set[str] = {
-    ext.lower() for ext in Image.registered_extensions()
-} | {ext.lower() for ext in RAW_EXTENSIONS}
-
-EXIF_DATETIME_KEYS = {k: v for k, v in ExifTags.TAGS.items() if v == "DateTime"}
-
-
-def _collect_paths(directory: Path, recursive: bool) -> list[Path]:
-    def is_supported(path: Path) -> bool:
-        return path.suffix.lower() in SUPPORTED_EXTENSIONS
-
-    if recursive:
-        return sorted(
-            [
-                path
-                for path in directory.rglob("*")
-                if path.is_file() and is_supported(path)
-            ]
-        )
-    return sorted(
-        [path for path in directory.iterdir() if path.is_file() and is_supported(path)]
-    )
-
-
-def _resolve_taken_time(image: Image.Image, path: Path) -> datetime:
-    try:
-        exif = image.getexif()
-        if exif:
-            for key in EXIF_DATETIME_KEYS:
-                value = exif.get(key)
-                if value:
-                    try:
-                        return datetime.strptime(str(value), "%Y:%m:%d %H:%M:%S")  # noqa: DTZ007
-                    except ValueError:
-                        logger.debug("Invalid EXIF date %s in %s", value, path)
-    except Exception as exc:  # pragma: no cover - depends on file availability
-        logger.debug("Failed to read EXIF from %s: %s", path, exc)
-
-    stat = path.stat()
-    timestamp = min(stat.st_mtime, stat.st_ctime)
-    return datetime.fromtimestamp(timestamp)  # noqa: DTZ006
-
-
 def _grouping_sort_key(photo: Photo) -> tuple[datetime, str]:
     return (photo.taken_time, photo.path.name)
-
-
-async def _load_photo(
-    path: Path, semaphore: anyio.Semaphore, ignore_errors: bool
-) -> Photo | None:
-    async with semaphore:
-        try:
-            image = await load_image_for_path_async(path)
-            taken_time = await run_sync(_resolve_taken_time, image, path)
-            hash_hex = await compute_phash_async(image)
-        except Exception as exc:  # pragma: no cover - depends on file content
-            if not ignore_errors:
-                raise
-            logger.warning("Skipping %s: %s", path, exc)
-            return None
-
-        return Photo(
-            path=path,
-            image=image,
-            taken_time=taken_time,
-            hash_hex=hash_hex,
-            format=path.suffix.upper().lstrip("."),
-        )
 
 
 class TimeCluster:
@@ -147,7 +79,7 @@ class StreamingBurstGrouper:
         if not directory.exists():
             raise FileNotFoundError(directory)
 
-        paths = _collect_paths(directory, recursive)
+        paths = collect_paths(directory, recursive=recursive)
         if not paths:
             yield GroupingResult(photos=[], groups=[], done=True)
             return
@@ -207,7 +139,9 @@ class StreamingBurstGrouper:
         ignore_errors: bool,
         send: ObjectSendStream[Photo],
     ) -> None:
-        photo = await _load_photo(path, semaphore, ignore_errors)
+        photo = await aload_photo(
+            path, semaphore=semaphore, ignore_errors=ignore_errors
+        )
         if photo is not None:
             await send.send(photo)
 
