@@ -1,5 +1,6 @@
 from datetime import datetime
 from pathlib import Path
+from typing import Generic, TypeVar, get_args
 
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
@@ -31,6 +32,9 @@ class Photo(BaseModel):
     keep: bool = True
 
 
+PhotoType = TypeVar("PhotoType", bound="Photo")
+OtherPhotoType = TypeVar("OtherPhotoType", bound="Photo")
+
 class Group(BaseModel):
     """Represents a burst group of photos."""
 
@@ -47,10 +51,28 @@ class Group(BaseModel):
         return len(self.photos)
 
 
-class PhotoResult(BaseModel):
+class PhotoResult(BaseModel, Generic[PhotoType]):
     """Snapshot returned by the streaming grouping pipeline."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    photos: list[Photo] = Field(default_factory=list)
+    photos: list[PhotoType] = Field(default_factory=list)
     done: bool = False
+
+    @property
+    def PhotosType(self) -> type[PhotoType]:
+        """The type of Photo this PhotoResult contains."""
+        # First loop through bases -- this will help generic
+        # any pydantic models.
+        for base in self.__class__.mro():
+            if hasattr(base, "__pydantic_generic_metadata__"):
+                metadata = base.__pydantic_generic_metadata__
+                if "args" in metadata and len(metadata["args"]) == 1:
+                    return metadata["args"][0]
+
+        for cls in self.__class__.__orig_bases__:  # type: ignore[attr-defined]
+            type_args = get_args(cls)
+            if type_args and len(type_args) == 1:
+                return type_args[0]
+
+        raise TypeError("Could not determine PhotoType for PhotoResult.")

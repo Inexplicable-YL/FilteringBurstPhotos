@@ -9,8 +9,8 @@ import anyio
 from anyio import to_thread
 from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
 
+from core.base.models import Photo
 from core.hashing.phash import aphash
-from core.models import Photo
 
 if TYPE_CHECKING:
     from pathlib import Path

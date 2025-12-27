@@ -8,13 +8,13 @@ import anyio
 from PySide6.QtCore import QObject, Signal
 
 from _count_time import timer
-from core.image_group import StreamingBurstGrouper
+from core.grouping.streaming import StreamingBurstGrouper
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from config.settings import Settings
-    from core.models import Group, Photo
+    from core.base.models import Group, Photo
 
 logger = logging.getLogger(__name__)
 

@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING
 import anyio
 
 from core.hashing.phash import hamming_distance
-from core.io.loader import aload_photo, collect_paths
-from core.models import Group, GroupingResult, Photo
+from core.load.utils import aload_photo, collect_paths
+from core.base.models import Group, GroupingResult, Photo
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator

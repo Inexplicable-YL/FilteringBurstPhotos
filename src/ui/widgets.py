@@ -35,7 +35,7 @@ from ui.constants import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from core.models import Group, Photo
+    from core.base.models import Group, Photo
 
 
 class LeftContainer(QWidget):
@@ -399,7 +399,7 @@ class PhotoThumbnail(QWidget):
         if size == self._current_size and hasattr(self, "_size_hint"):
             return
         self._current_size = size
-        minimal = size < 70  # noqa: PLR2004
+        minimal = size < 70
         self.image_label.setVisible(not minimal)
         if not minimal:
             self.image_label.setFixedSize(QSize(size, size))
