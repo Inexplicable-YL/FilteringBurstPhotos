@@ -177,13 +177,13 @@ class Streamable(ABC, Generic[Input, PhotoType]):
         self, other: Streamable[Input, OtherPhotoType]
     ) -> Streamable[Input, OtherPhotoType]:
         _ensure_subclass(other.PhotoType, self.PhotoType)
-        return StreamableChain(self, other)
+        return StreamableSequence(self, other)
 
     def __ror__(
         self, other: Streamable[Input, PhotoType]
     ) -> Streamable[Input, PhotoType]:
         _ensure_subclass(self.PhotoType, other.PhotoType)
-        return StreamableChain(other, self)
+        return StreamableSequence(other, self)
 
     def pipe(
         self,
@@ -191,7 +191,7 @@ class Streamable(ABC, Generic[Input, PhotoType]):
         name: str | None = None,
     ) -> Streamable[Input, OtherPhotoType]:
         """"""
-        return StreamableChain(self, *others, name=name)
+        return StreamableSequence(self, *others, name=name)
 
     def __and__(
         self, other: Streamable[Input, PhotoType]
@@ -239,7 +239,7 @@ class StreamableSerializable(Serializable, Streamable[Input, PhotoType]):
         return dumped
 
 
-class StreamableChain(StreamableSerializable[Input, PhotoType]):
+class StreamableSequence(StreamableSerializable[Input, PhotoType]):
     start: Streamable[Input, Any]
     middle: list[Streamable[Any, Any]] = Field(default_factory=list)
     end: Streamable[Any, PhotoType]
@@ -256,12 +256,14 @@ class StreamableChain(StreamableSerializable[Input, PhotoType]):
         if not chains and start is not None and end is not None:
             chains_flat = [start] + (middle or []) + [end]
         for chain in chains:
-            if isinstance(chain, StreamableChain):
+            if isinstance(chain, StreamableSequence):
                 chains_flat.extend(chain.chains)
             else:
                 chains_flat.append(chain)
         if len(chains_flat) < 2:
-            msg = f"StreamableChain must have at least 2 steps, got {len(chains_flat)}"
+            msg = (
+                f"StreamableSequence must have at least 2 steps, got {len(chains_flat)}"
+            )
             raise ValueError(msg)
 
         datas = {

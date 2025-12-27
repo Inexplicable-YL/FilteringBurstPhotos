@@ -5,6 +5,9 @@ from typing import Generic, TypeVar, get_args
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 
+PhotoType = TypeVar("PhotoType", bound="Photo")
+OtherPhotoType = TypeVar("OtherPhotoType", bound="Photo")
+
 
 class Photo(BaseModel):
     """Represents a single photo on disk.
@@ -14,41 +17,17 @@ class Photo(BaseModel):
         taken_time: Best-effort capture time.
         hash_hex: Hex representation of the perceptual hash.s
         format: File extension in upper case (e.g. JPG, CR3).
-        group_id: Identifier assigned during grouping.
         keep: Whether the user decided to keep the photo.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     path: Path
-
     raw_image: Image.Image
     image: Image.Image
-
     taken_time: datetime
-    hash_hex: str
     format: str
-    group_id: int | None = None
     keep: bool = True
-
-
-PhotoType = TypeVar("PhotoType", bound="Photo")
-OtherPhotoType = TypeVar("OtherPhotoType", bound="Photo")
-
-class Group(BaseModel):
-    """Represents a burst group of photos."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    id: int
-    photos: list[Photo] = Field(default_factory=list)
-
-    @property
-    def representative(self) -> Photo | None:
-        return self.photos[0] if self.photos else None
-
-    def size(self) -> int:
-        return len(self.photos)
 
 
 class PhotoResult(BaseModel, Generic[PhotoType]):
@@ -57,6 +36,7 @@ class PhotoResult(BaseModel, Generic[PhotoType]):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     photos: list[PhotoType] = Field(default_factory=list)
+    metadata: dict = Field(default_factory=dict)
     done: bool = False
 
     @property
@@ -76,3 +56,19 @@ class PhotoResult(BaseModel, Generic[PhotoType]):
                 return type_args[0]
 
         raise TypeError("Could not determine PhotoType for PhotoResult.")
+
+
+class Group(BaseModel):
+    """Represents a burst group of photos."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    id: int
+    photos: list[Photo] = Field(default_factory=list)
+
+    @property
+    def representative(self) -> Photo | None:
+        return self.photos[0] if self.photos else None
+
+    def size(self) -> int:
+        return len(self.photos)

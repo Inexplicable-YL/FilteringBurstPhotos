@@ -144,8 +144,6 @@ class Serializable(BaseModel, ABC):
 
         The unique identifier is a list of strings that describes the path
         to the object.
-        For example, for the class `langchain.llms.openai.OpenAI`, the id is
-        ["langchain", "llms", "openai", "OpenAI"].
         """
         # Pydantic generics change the class name. So we need to do the following
         if (
