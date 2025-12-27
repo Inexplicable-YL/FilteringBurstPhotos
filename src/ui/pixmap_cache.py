@@ -13,7 +13,7 @@ from ui.image_utils import pil_to_qpixmap, scale_pixmap
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from core.base.models import Photo
+    from core.streamables.models import Photo
 
 # Pillow renamed Resampling in newer versions; keep backward compatibility.
 RESAMPLE_MODE = (

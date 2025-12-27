@@ -16,8 +16,8 @@ from typing_extensions import override
 import anyio
 from pydantic import ConfigDict, Field
 
-from core.base.models import OtherPhotoType, Photo, PhotoResult, PhotoType
-from core.base.serializable import (
+from core.streamables.models import OtherPhotoType, Photo, PhotoResult, PhotoType
+from core.streamables.serializable import (
     Serializable,
     SerializedConstructor,
     SerializedNotImplemented,

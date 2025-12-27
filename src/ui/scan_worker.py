@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from config.settings import Settings
-    from core.base.models import Group, Photo
+    from core.streamables.models import Group, Photo
 
 logger = logging.getLogger(__name__)
 

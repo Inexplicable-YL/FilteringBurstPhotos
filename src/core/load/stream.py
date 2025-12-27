@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING
 
 import anyio
 
-from core.base.models import Photo, PhotoResult
-from core.base.stream import Streamable, StreamableConfig
+from core.streamables.models import Photo, PhotoResult
+from core.streamables.base import Streamable, StreamableConfig
 from core.load.utils import aload_photo, collect_paths
 
 if TYPE_CHECKING:
