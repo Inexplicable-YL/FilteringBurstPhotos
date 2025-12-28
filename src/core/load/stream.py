@@ -5,8 +5,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+from collections.abc import AsyncIterator
 
 import anyio
+from typing_extensions import override
 
 from core.streamables.models import Photo, PhotoResult
 from core.streamables.base import Streamable, StreamableConfig
@@ -58,20 +60,33 @@ class StreamLoader(Streamable[Photo, LoadInput]):
         self._paths: set[Path] = set()
         self._photos_by_path: dict[Path, Photo] = {}
 
-    async def iter(
+    @override
+    async def invoke(
         self,
         input: LoadInput,
-        config: StreamableConfig,
+        receive: PhotoResult[Photo] | None = None,
+        config: StreamableConfig | None = None,
+        **kwargs: object,
+    ) -> PhotoResult[Photo]:
+        last: PhotoResult[Photo] | None = None
+        async for snapshot in self.stream(input, None, config or {}, **kwargs):
+            last = snapshot
+        if last is None:
+            return PhotoResult[Photo](photos=[], done=True)
+        return last
+
+    @override
+    async def stream(
+        self,
+        input: LoadInput,
+        receives: AsyncIterator[PhotoResult[Photo]] | None = None,
+        config: StreamableConfig | None = None,
+        **kwargs: object,
     ) -> AsyncIterator[PhotoResult[Photo]]:
-        """Yield grouping snapshots while photos are loaded and hashed.
+        """Yield grouping snapshots while photos are loaded and hashed."""
+        if receives is not None:
+            raise ValueError("StreamLoader does not accept upstream PhotoResult.")
 
-        Args:
-            input: Parameters describing what to load.
-            config: Streamable runtime config.
-
-        Yields:
-            PhotoResult instances representing each processed batch.
-        """
         directory = input.directory
         if not directory.exists():
             raise FileNotFoundError(directory)
@@ -93,23 +108,6 @@ class StreamLoader(Streamable[Photo, LoadInput]):
             for photo in snapshot.photos:
                 self._photos_by_path[photo.path] = photo
             yield snapshot
-
-    async def stream(
-        self,
-        input: LoadInput,
-        config: StreamableConfig,
-        receive: ObjectReceiveStream[PhotoResult[Photo]],
-    ) -> AsyncIterator[PhotoResult[Photo]]:
-        async def _drain() -> None:
-            async with receive:
-                async for snapshot in receive:
-                    if snapshot.done:
-                        break
-
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(_drain)
-            async for snapshot in self.iter(input, config):
-                yield snapshot
 
     async def _iter(
         self,
@@ -241,8 +239,10 @@ class StreamLoader(Streamable[Photo, LoadInput]):
             photos=sorted(batch, key=_grouping_sort_key),
         )
 
-    def _resolve_max_concurrency(self, config: StreamableConfig) -> int | None:
-        if "max_concurrency" not in config:
+    def _resolve_max_concurrency(
+        self, config: StreamableConfig | None
+    ) -> int | None:
+        if config is None or "max_concurrency" not in config:
             return self.max_concurrency
         max_concurrency = config["max_concurrency"]
         if max_concurrency is None:
