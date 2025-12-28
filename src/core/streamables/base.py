@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from copy import deepcopy
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -25,7 +26,7 @@ from core.streamables.serializable import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator
 
     from anyio.abc import ObjectReceiveStream, ObjectSendStream
 
@@ -66,7 +67,12 @@ def _coerce_photo_result(
         photo if isinstance(photo, target_type) else target_type(**photo.model_dump())
         for photo in result.photos
     ]
-    return PhotoResult[target_type](photos=photos)
+    return PhotoResult[target_type](photos=photos, metadata=deepcopy(result.metadata))
+
+
+def _clone_photo_result(result: PhotoResult[PhotoType]) -> PhotoResult[PhotoType]:
+    """Create a deep copy to isolate mutations across parallel branches."""
+    return result.model_copy(deep=True)
 
 
 class Streamable(ABC, Generic[Input, PhotoType]):
@@ -384,7 +390,9 @@ class StreamableParallel(StreamableSerializable[Input, PhotoType]):
         results: list[PhotoResult[PhotoType] | None] = [None] * len(self.steps)
 
         async def _run(idx: int, step: Streamable[Input, PhotoType]) -> None:
-            res = await step.invoke(input, upstream.model_copy(), config=config, **kwargs)
+            res = await step.invoke(
+                input, _clone_photo_result(upstream), config=config, **kwargs
+            )
             results[idx] = _coerce_photo_result(res, self.PhotoType)
 
         async with anyio.create_task_group() as tg:
@@ -427,50 +435,66 @@ class StreamableParallel(StreamableSerializable[Input, PhotoType]):
             child_recvs.append(r)
 
         outpot_cond: anyio.Condition = anyio.Condition()
+        step_done: list[bool] = [False] * len(self.steps)
 
         async def _broadcast() -> None:
             try:
                 async for item in receives:
                     coerced = _coerce_photo_result(item, self.PhotoType)
-                    await base_send.send(coerced)
+                    await base_send.send(_clone_photo_result(coerced))
                     for send in child_sends:
-                        await send.send(coerced)
+                        await send.send(_clone_photo_result(coerced))
             finally:
                 await base_send.aclose()
                 for send in child_sends:
                     await send.aclose()
 
         async def _run_step(idx: int, step: Streamable[Input, PhotoType]) -> None:
-            async with child_recvs[idx]:
-                async for result in step.stream(input, child_recvs[idx], config):
-                    coerced = _coerce_photo_result(result, self.PhotoType)
-                    if unique_id := coerced.get_unique_id():
-                        async with outpot_cond:
-                            step_outputs[unique_id][idx] = coerced
-                            outpot_cond.notify_all()
+            try:
+                async with child_recvs[idx]:
+                    async for result in step.stream(input, child_recvs[idx], config):
+                        coerced = _coerce_photo_result(result, self.PhotoType)
+                        if unique_id := coerced.get_unique_id():
+                            async with outpot_cond:
+                                step_outputs[unique_id][idx] = _clone_photo_result(
+                                    coerced
+                                )
+                                outpot_cond.notify_all()
+            finally:
+                async with outpot_cond:
+                    step_done[idx] = True
+                    outpot_cond.notify_all()
 
         async def _collect_outputs() -> AsyncIterator[PhotoResult[PhotoType]]:
-            def _all_steps_done(_unique_id: str) -> Callable[[], bool]:
-                return lambda: all(
-                    step_outputs[_unique_id][idx] is not None
-                    for idx in range(len(self.steps))
-                )
-
             async with base_recv:
                 async for base_item in base_recv:
                     unique_id = base_item.get_unique_id()
                     if unique_id is None:
                         continue
-                    async with outpot_cond:
-                        await outpot_cond.wait_for(
-                            _all_steps_done(unique_id),
-                        )
-                    merged = self._merge_step_results(
-                        base_item,
-                        cast("list[PhotoResult[PhotoType]]", step_outputs[unique_id]),
-                    )
-                    step_outputs.pop(unique_id, None)
-                    yield merged
+                    while True:
+                        async with outpot_cond:
+                            outputs = step_outputs[unique_id]
+                            missing = [
+                                idx for idx, res in enumerate(outputs) if res is None
+                            ]
+                            if not missing:
+                                merged = self._merge_step_results(
+                                    base_item,
+                                    cast(
+                                        "list[PhotoResult[PhotoType]]",
+                                        outputs,
+                                    ),
+                                )
+                                step_outputs.pop(unique_id, None)
+                                yield merged
+                                break
+                            if any(step_done[idx] for idx in missing):
+                                step_outputs.pop(unique_id, None)
+                                raise ValueError(
+                                    "Parallel step results missing for unique ID "
+                                    f"{unique_id}."
+                                )
+                            await outpot_cond.wait()
 
         async with anyio.create_task_group() as tg:
             tg.start_soon(_broadcast)
@@ -488,15 +512,26 @@ class StreamableParallel(StreamableSerializable[Input, PhotoType]):
             raise ValueError("No step results to merge.")
 
         def _merge_photos(photos: list[PhotoType]) -> PhotoType:
-            merged_data = photos[0].model_dump()
+            base_photo = photos[0]
+            base_data = base_photo.model_dump()
+            merged_data = base_data.copy()
+            changed_keys: set[str] = set()
+
             for photo in photos[1:]:
-                update = {
-                    key: value
-                    for key, value in photo.model_dump().items()
-                    if value is not None
-                }
-                merged_data.update(update)
-            return photos[0].__class__(**merged_data)
+                photo_data = photo.model_dump()
+                for key, value in photo_data.items():
+                    base_value = base_data.get(key)
+                    if value == base_value:
+                        continue
+                    if key in changed_keys:
+                        raise ValueError(
+                            "Parallel steps modified the same field "
+                            f"'{key}' for photo {base_photo.get_unique_id()}."
+                        )
+                    changed_keys.add(key)
+                    merged_data[key] = value
+
+            return base_photo.PhotoType(**merged_data)
 
         base_strict_id = base.get_unique_id(strict=True)
         shared_strict_ids = {
@@ -545,8 +580,20 @@ class StreamableParallel(StreamableSerializable[Input, PhotoType]):
             merged_photos.append(_merge_photos(photos))
 
         merged_metadata: dict[str, Any] = dict(base.metadata)
+        changed_meta_keys: set[str] = set()
         for result in step_results:
-            merged_metadata.update(result.metadata)
+            for key, value in result.metadata.items():
+                base_value = base.metadata.get(key)
+                if value == base_value:
+                    continue
+                if key in changed_meta_keys:
+                    raise ValueError(
+                        "Parallel steps modified the same metadata field "
+                        f"'{key}' for PhotoResult {base.get_unique_id()}."
+                    )
+                changed_meta_keys.add(key)
+                merged_metadata[key] = value
+
         return PhotoResult[PhotoType](photos=merged_photos, metadata=merged_metadata)
 
 

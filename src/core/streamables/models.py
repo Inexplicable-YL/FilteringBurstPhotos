@@ -1,7 +1,7 @@
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Generic, TypeVar, get_args
+from typing import Generic, Self, TypeVar, get_args
 
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
@@ -23,7 +23,7 @@ class Photo(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    type: str
+    photo_type: str
     id: str
     path: Path
     raw_image: Image.Image
@@ -32,12 +32,17 @@ class Photo(BaseModel):
     format: str
     keep: bool = True
 
+    @property
+    def PhotoType(self) -> type[Self]:
+        """The type of Photo this Photo instance is."""
+        return self.__class__
+
     def get_type(self, suffix: str | None = None, *, type: str | None = None) -> str:
         """Get the type of the Runnable."""
         if type:
             type_ = type
-        elif hasattr(self, "type") and self.type:
-            type_ = self.type
+        elif hasattr(self, "type") and self.photo_type:
+            type_ = self.photo_type
         else:
             # Here we handle a case where the runnable subclass is also a pydantic
             # model.
