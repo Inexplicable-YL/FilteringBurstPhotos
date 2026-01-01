@@ -32,6 +32,10 @@ def stream_buffer(config: TransableConfig | None) -> int:
 
 
 def ensure_subclass(child: type[Photo], parent: type[Photo]) -> None:
+    if not (inspect.isclass(child) and inspect.isclass(parent)):
+        return
+    if child is Any or parent is Any:
+        return
     if not issubclass(child, parent):
         raise TypeError(
             f"PhotoType mismatch: {child.__name__} is not a subclass of {parent.__name__}"

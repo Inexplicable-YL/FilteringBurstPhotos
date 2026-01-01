@@ -4,7 +4,14 @@ import contextlib
 import inspect
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -206,6 +213,33 @@ class Transable(ABC, Generic[Input, PhotoType]):
             return
         async for item in receives:
             yield await self.invoke(input, item, config=config, **kwargs)
+
+    async def batch(
+        self,
+        input: Input,
+        receives: list[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        **kwargs: Any,
+    ) -> list[PhotoType]:
+        """Consume a batch of inputs and return a list of results."""
+
+        async def _receives_iter() -> AsyncIterator[PhotoType]:
+            for item in receives or []:
+                yield coerce_photo(item, self.PhotoType)
+
+        return [
+            item
+            async for item in self.stream(
+                input,
+                None if receives is None else _receives_iter(),
+                config=config,
+                **kwargs,
+            )
+        ]
+
+    def bind(self, **kwargs: Any) -> Transable[Input, PhotoType]:
+        """Return a bound transable with pre-applied kwargs."""
+        return TransableBinding(bound=self, kwargs=kwargs, config={})
 
 
 class TransableSerializable(Serializable, Transable[Input, PhotoType]):
@@ -414,11 +448,11 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         target_input_type = transable.InputType
         if sequence_input_type is Any or target_input_type is Any:
             return
-        if (
-            inspect.isclass(sequence_input_type)
-            and inspect.isclass(target_input_type)
-            and not issubclass(sequence_input_type, target_input_type)
+        if not (
+            inspect.isclass(sequence_input_type) and inspect.isclass(target_input_type)
         ):
+            return
+        if not issubclass(sequence_input_type, target_input_type):
             raise TypeError(
                 f"InputType mismatch for {transable.get_name()}: "
                 f"{target_input_type.__name__} expected, "
@@ -508,7 +542,9 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
             lambda: [None] * len(self.steps)
         )
 
-        base_send, base_recv = anyio.create_memory_object_stream[PhotoType](buffer_size)
+        # Use an unbounded base stream to avoid backpressure deadlocks when downstream
+        # steps need to buffer multiple items before yielding.
+        base_send, base_recv = anyio.create_memory_object_stream[PhotoType](0)
         child_sends: list[ObjectSendStream[PhotoType]] = []
         child_recvs: list[ObjectReceiveStream[PhotoType]] = []
         for _ in self.steps:
@@ -574,6 +610,12 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                                     f"{unique_id}."
                                 )
                             await outpot_cond.wait()
+                # Base stream exhausted; if steps emitted unmatched IDs, surface them.
+                if step_outputs:
+                    raise ValueError(
+                        "Parallel step produced results with no matching base item: "
+                        f"{', '.join(step_outputs.keys())}"
+                    )
 
         async with anyio.create_task_group() as tg:
             tg.start_soon(_broadcast)
@@ -837,6 +879,139 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
                 return self.stream_func == other.stream_func
             return False
         return False
+
+
+class TransableBinding(TransableSerializable[Input, PhotoType]):
+    """Transable that delegates to another Transable with bound kwargs/config."""
+
+    bound: Transable[Input, PhotoType]
+    kwargs: Mapping[str, Any] = Field(default_factory=dict)
+    config: TransableConfig = Field(default_factory=dict)  # type: ignore[arg-type]
+    config_factories: list[Callable[[TransableConfig], TransableConfig]] = Field(
+        default_factory=list
+    )
+    custom_input_type: type[Input] | None = None
+    custom_photo_type: type[PhotoType] | None = None
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def __init__(
+        self,
+        *,
+        bound: Transable[Input, PhotoType],
+        kwargs: Mapping[str, Any] | None = None,
+        config: TransableConfig | None = None,
+        config_factories: Sequence[Callable[[TransableConfig], TransableConfig]]
+        | None = None,
+        custom_input_type: type[Input] | None = None,
+        custom_photo_type: type[PhotoType] | None = None,
+        **other_kwargs: Any,
+    ) -> None:
+        params = {
+            "bound": bound,
+            "kwargs": kwargs or {},
+            "config": config or {},
+            "config_factories": list(config_factories or []),
+            "custom_input_type": custom_input_type,
+            "custom_photo_type": custom_photo_type,
+        }
+        super().__init__(
+            **params,
+            **other_kwargs,
+        )
+        self.config = config or {}
+
+    @override
+    def get_name(self, suffix: str | None = None, *, name: str | None = None) -> str:
+        return self.bound.get_name(suffix, name=name)
+
+    @property
+    @override
+    def InputType(self) -> type[Input]:
+        return (
+            cast("type[Input]", self.custom_input_type)
+            if self.custom_input_type is not None
+            else self.bound.InputType
+        )
+
+    @property
+    @override
+    def PhotoType(self) -> type[PhotoType]:
+        return (
+            cast("type[PhotoType]", self.custom_photo_type)
+            if self.custom_photo_type is not None
+            else self.bound.PhotoType
+        )
+
+    def _merge_configs(self, *configs: TransableConfig | None) -> TransableConfig:
+        merged: TransableConfig = {**self.config}
+        for conf in configs:
+            if conf:
+                merged = {**merged, **conf}
+        for factory in self.config_factories:
+            merged = factory(merged)
+        return merged
+
+    @override
+    async def invoke(
+        self,
+        input: Input,
+        receive: PhotoType | None = None,
+        config: TransableConfig | None = None,
+        **kwargs: Any,
+    ) -> PhotoType:
+        merged_config = self._merge_configs(config)
+        return await self.bound.invoke(
+            input,
+            receive,
+            merged_config,
+            **{**self.kwargs, **kwargs},
+        )
+
+    @override
+    async def stream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[PhotoType]:
+        merged_config = self._merge_configs(config)
+        async for item in self.bound.stream(
+            input,
+            receives,
+            merged_config,
+            **{**self.kwargs, **kwargs},
+        ):
+            yield item
+
+    @override
+    async def batch(
+        self,
+        input: Input,
+        receives: list[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        **kwargs: Any,
+    ) -> list[PhotoType]:
+        merged_config = self._merge_configs(config)
+        return await self.bound.batch(
+            input,
+            receives,
+            merged_config,
+            **{**self.kwargs, **kwargs},
+        )
+
+    @override
+    def bind(self, **kwargs: Any) -> Transable[Input, PhotoType]:
+        """Bind additional kwargs to a Transable, returning a new Transable."""
+        return self.__class__(
+            bound=self.bound,
+            config=self.config,
+            config_factories=self.config_factories,
+            kwargs={**self.kwargs, **kwargs},
+            custom_input_type=self.custom_input_type,
+            custom_photo_type=self.custom_photo_type,
+        )
 
 
 class _TransableCallableSync(Protocol[Input, PhotoType]):
