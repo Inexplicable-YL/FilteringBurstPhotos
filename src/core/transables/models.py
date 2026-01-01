@@ -35,13 +35,13 @@ class Photo(BaseModel):
         return self.__class__
 
     def get_type(self, suffix: str | None = None, *, type: str | None = None) -> str:
-        """Get the type of the Runnable."""
+        """Get the type of the Transable."""
         if type:
             type_ = type
         elif hasattr(self, "type") and self.photo_type:
             type_ = self.photo_type
         else:
-            # Here we handle a case where the runnable subclass is also a pydantic
+            # Here we handle a case where the transable subclass is also a pydantic
             # model.
             cls = self.__class__
             # Then it's a pydantic sub-class, and we have to check

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 
 Input = TypeVar("Input")
+OtherInput = TypeVar("OtherInput")
 Output = TypeVar("Output")
 PhotoType = TypeVar("PhotoType", bound="Photo")
 OtherPhotoType = TypeVar("OtherPhotoType", bound="Photo")

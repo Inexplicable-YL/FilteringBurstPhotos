@@ -9,6 +9,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Generic,
+    Protocol,
     cast,
     get_args,
 )
@@ -25,6 +26,7 @@ from core.transables.serializable import (
 )
 from core.transables.utils import (
     Input,
+    OtherInput,
     OtherPhotoType,
     PhotoType,
     call_func_with_variable_args,
@@ -48,13 +50,13 @@ class Transable(ABC, Generic[Input, PhotoType]):
     name: str | None
 
     def get_name(self, suffix: str | None = None, *, name: str | None = None) -> str:
-        """Get the name of the Runnable."""
+        """Get the name of the Transable."""
         if name:
             name_ = name
         elif hasattr(self, "name") and self.name:
             name_ = self.name
         else:
-            # Here we handle a case where the runnable subclass is also a pydantic
+            # Here we handle a case where the transable subclass is also a pydantic
             # model.
             cls = self.__class__
             # Then it's a pydantic sub-class, and we have to check
@@ -91,7 +93,7 @@ class Transable(ABC, Generic[Input, PhotoType]):
 
         # If we didn't find a pydantic model in the parent classes,
         # then loop through __orig_bases__. This corresponds to
-        # Runnables that are not pydantic models.
+        # Transables that are not pydantic models.
         for cls in self.__class__.__orig_bases__:  # type: ignore[attr-defined]
             type_args = get_args(cls)
             if type_args and len(type_args) == 2:
@@ -125,6 +127,61 @@ class Transable(ABC, Generic[Input, PhotoType]):
         )
         raise TypeError(msg)
 
+    def __or__(
+        self,
+        other: Transable[Any, OtherPhotoType]
+        | Callable[[Any], OtherPhotoType]
+        | Callable[[Any], Awaitable[OtherPhotoType]]
+        | Callable[[Any, Iterator[OtherPhotoType]], Iterator[OtherPhotoType]]
+        | Callable[[Any, AsyncIterator[OtherPhotoType]], AsyncIterator[OtherPhotoType]],
+    ) -> TransableSerializable[Input, OtherPhotoType]:
+        return TransableSequence(self, other)
+
+    def __ror__(
+        self,
+        other: Transable[OtherInput, Any]
+        | Callable[[OtherInput], Any]
+        | Callable[[OtherInput], Awaitable[Any]]
+        | Callable[[OtherInput, Iterator[Any]], Iterator[Any]]
+        | Callable[[OtherInput, AsyncIterator[Any]], AsyncIterator[Any]],
+    ) -> TransableSerializable[OtherInput, PhotoType]:
+        return TransableSequence(other, self)
+
+    def pipe(
+        self,
+        *others: Transable[Any, OtherPhotoType] | Callable[[Any], OtherPhotoType],
+        name: str | None = None,
+    ) -> TransableSerializable[Input, OtherPhotoType]:
+        """"""
+        return TransableSequence(self, *others, name=name)
+
+    def __and__(
+        self,
+        other: Transable[Any, Any]
+        | Callable[[Any], Any]
+        | Callable[[Any], Awaitable[Any]]
+        | Callable[[Any, Iterator[Any]], Iterator[Any]]
+        | Callable[[Any, AsyncIterator[Any]], AsyncIterator[Any]],
+    ) -> TransableSerializable[Input, PhotoType]:
+        return TransableParallel(self, other)
+
+    def __rand__(
+        self,
+        other: Transable[Any, Any]
+        | Callable[[Any], Any]
+        | Callable[[Any], Awaitable[Any]]
+        | Callable[[Any, Iterator[Any]], Iterator[Any]]
+        | Callable[[Any, AsyncIterator[Any]], AsyncIterator[Any]],
+    ) -> TransableSerializable[Input, PhotoType]:
+        return TransableParallel(other, self)
+
+    def parallel(
+        self,
+        *others: Transable[Input, PhotoType],
+    ) -> TransableSerializable[Input, PhotoType]:
+        """"""
+        return TransableParallel(self, *others)
+
     @abstractmethod
     async def invoke(
         self,
@@ -150,50 +207,9 @@ class Transable(ABC, Generic[Input, PhotoType]):
         async for item in receives:
             yield await self.invoke(input, item, config=config, **kwargs)
 
-    def __or__(
-        self, other: Transable[Input, OtherPhotoType]
-    ) -> Transable[Input, OtherPhotoType]:
-        ensure_subclass(other.PhotoType, self.PhotoType)
-        return TransableSequence(self, other)
-
-    def __ror__(
-        self, other: Transable[Input, PhotoType]
-    ) -> Transable[Input, PhotoType]:
-        ensure_subclass(self.PhotoType, other.PhotoType)
-        return TransableSequence(other, self)
-
-    def pipe(
-        self,
-        *others: Transable[Any, OtherPhotoType],
-        name: str | None = None,
-    ) -> Transable[Input, OtherPhotoType]:
-        """"""
-        return TransableSequence(self, *others, name=name)
-
-    def __and__(
-        self, other: Transable[Input, PhotoType]
-    ) -> Transable[Input, PhotoType]:
-        if other.PhotoType is not self.PhotoType:
-            raise TypeError("Parallel Transables require identical PhotoType values.")
-        return TransableParallel(self, other)
-
-    def __rand__(
-        self, other: Transable[Input, PhotoType]
-    ) -> Transable[Input, PhotoType]:
-        if other.PhotoType is not self.PhotoType:
-            raise TypeError("Parallel Transables require identical PhotoType values.")
-        return TransableParallel(other, self)
-
-    def parallel(
-        self,
-        *others: Transable[Input, PhotoType],
-    ) -> Transable[Input, PhotoType]:
-        """"""
-        return TransableParallel(self, *others)
-
 
 class TransableSerializable(Serializable, Transable[Input, PhotoType]):
-    """Runnable that can be serialized to JSON."""
+    """Transable that can be serialized to JSON."""
 
     name: str | None = None
 
@@ -205,10 +221,10 @@ class TransableSerializable(Serializable, Transable[Input, PhotoType]):
 
     @override
     def to_json(self) -> SerializedConstructor | SerializedNotImplemented:
-        """Serialize the Runnable to JSON.
+        """Serialize the Transable to JSON.
 
         Returns:
-            A JSON-serializable representation of the Runnable.
+            A JSON-serializable representation of the Transable.
         """
         dumped = super().to_json()
         with contextlib.suppress(Exception):
@@ -223,7 +239,7 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
 
     def __init__(
         self,
-        *chains: Transable[Any, Any],
+        *chains: TransableLike,
         name: str | None = None,
         start: Transable[Input, Any] | None = None,
         middle: list[Transable[Any, Any]] | None = None,
@@ -236,7 +252,7 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
             if isinstance(chain, TransableSequence):
                 chains_flat.extend(chain.chains)
             else:
-                chains_flat.append(chain)
+                chains_flat.append(coerce_to_transable(chain))
         if len(chains_flat) < 2:
             msg = (
                 f"TransableSequence must have at least 2 steps, got {len(chains_flat)}"
@@ -254,23 +270,77 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
     @property
     @override
     def InputType(self) -> type[Input]:
-        """The type of the input to the Runnable."""
+        """The type of the input to the Transable."""
         return self.start.InputType
 
     @property
     @override
     def PhotoType(self) -> type[PhotoType]:
-        """The type of the output of the Runnable."""
+        """The type of the output of the Transable."""
         return self.end.PhotoType
 
     @property
     def chains(self) -> list[Transable[Any, Any]]:
-        """All the Runnables that make up the sequence in order.
+        """All the Transables that make up the sequence in order.
 
         Returns:
-            A list of Runnables.
+            A list of Transables.
         """
         return [self.start, *self.middle, self.end]
+
+    @override
+    def __or__(
+        self,
+        other: Transable[Any, OtherPhotoType]
+        | Callable[[Any], OtherPhotoType]
+        | Callable[[Any], Awaitable[OtherPhotoType]]
+        | Callable[[Any, Iterator[OtherPhotoType]], Iterator[OtherPhotoType]]
+        | Callable[[Any, AsyncIterator[OtherPhotoType]], AsyncIterator[OtherPhotoType]],
+    ) -> TransableSerializable[Input, OtherPhotoType]:
+        if isinstance(other, TransableSequence):
+            return TransableSequence(
+                self.start,
+                *self.middle,
+                self.end,
+                other.start,
+                *other.middle,
+                other.end,
+                name=self.name or other.name,
+            )
+        return TransableSequence(
+            self.start,
+            *self.middle,
+            self.end,
+            coerce_to_transable(other),
+            name=self.name,
+        )
+
+    @override
+    def __ror__(
+        self,
+        other: Transable[OtherInput, Any]
+        | Callable[[OtherInput], Any]
+        | Callable[[OtherInput], Awaitable[Any]]
+        | Callable[[OtherInput, Iterator[Any]], Iterator[Any]]
+        | Callable[[OtherInput, AsyncIterator[Any]], AsyncIterator[Any]],
+    ) -> TransableSerializable[OtherInput, PhotoType]:
+        if isinstance(other, TransableSequence):
+            return TransableSequence(
+                other.start,
+                *other.middle,
+                other.end,
+                self.start,
+                *self.middle,
+                self.end,
+                name=self.name or other.name,
+            )
+        return TransableSequence(
+            coerce_to_transable(other),
+            self.start,
+            *self.middle,
+            self.end,
+            name=self.name,
+        )
 
     @override
     async def invoke(
@@ -339,7 +409,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
 
     def __init__(
         self,
-        *steps: Transable[Input, PhotoType],
+        *steps: TransableLike,
         name: str | None = None,
     ) -> None:
         flat: list[Transable[Input, PhotoType]] = []
@@ -347,7 +417,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
             if isinstance(step, TransableParallel):
                 flat.extend(step.steps)
             else:
-                flat.append(step)
+                flat.append(coerce_to_transable(step))
         if len(flat) < 2:
             raise ValueError(
                 f"TransableParallel must have at least 2 steps, got {len(flat)}"
@@ -365,7 +435,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
     @property
     @override
     def InputType(self) -> type[Input]:
-        """The type of the input to the Runnable."""
+        """The type of the input to the Transable."""
         return self.steps[0].InputType
 
     @override
@@ -521,7 +591,7 @@ TransableFuncType = (
 )
 
 
-class TransableLambda(Transable[Input, PhotoType]):
+class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
     """Transable defined from a pair of functions."""
 
     def __init__(
@@ -541,6 +611,7 @@ class TransableLambda(Transable[Input, PhotoType]):
                     "Func was provided along with stream_func, but func is async or a generator. "
                     "Only one of func or stream_func should be provided in this case."
                 )
+            self.func = func
             self.stream_func = func
             func_for_name = func
         elif is_async_callable(func) or callable(func):
@@ -560,7 +631,7 @@ class TransableLambda(Transable[Input, PhotoType]):
     @property
     @override
     def InputType(self) -> Any:
-        """The type of the input to this Runnable."""
+        """The type of the input to this Transable."""
         func = getattr(self, "func", None) or self.stream_func
         try:
             params = inspect.signature(func).parameters
@@ -574,10 +645,10 @@ class TransableLambda(Transable[Input, PhotoType]):
     @property
     @override
     def PhotoType(self) -> Any:
-        """The type of the output of this Runnable as a type annotation.
+        """The type of the output of this Transable as a type annotation.
 
         Returns:
-            The type of the output of this Runnable.
+            The type of the output of this Transable.
         """
         func = getattr(self, "func", None) or self.stream_func
         try:
@@ -738,3 +809,72 @@ class TransableLambda(Transable[Input, PhotoType]):
                 return self.stream_func == other.stream_func
             return False
         return False
+
+
+class _TransableCallableSync(Protocol[Input, PhotoType]):
+    def __call__(
+        self, _in: Input, /, *, receive: PhotoType, config: TransableConfig
+    ) -> PhotoType: ...
+
+
+class _TransableCallableAsync(Protocol[Input, PhotoType]):
+    def __call__(
+        self, _in: Input, /, *, receive: PhotoType, config: TransableConfig
+    ) -> Awaitable[PhotoType]: ...
+
+
+class _TransableCallableIterator(Protocol[Input, PhotoType]):
+    def __call__(
+        self, _in: Input, /, *, receives: Iterator[PhotoType], config: TransableConfig
+    ) -> Iterator[PhotoType]: ...
+
+
+class _TransableCallableAsyncIterator(Protocol[Input, PhotoType]):
+    def __call__(
+        self,
+        _in: Input,
+        /,
+        *,
+        receives: AsyncIterator[PhotoType],
+        config: TransableConfig,
+    ) -> AsyncIterator[PhotoType]: ...
+
+
+TransableLike = (
+    Transable[Input, PhotoType]
+    | Callable[[Input], PhotoType]
+    | Callable[[Input], Awaitable[PhotoType]]
+    | Callable[[Input, Iterator[PhotoType]], Iterator[PhotoType]]
+    | Callable[[Input, AsyncIterator[PhotoType]], AsyncIterator[PhotoType]]
+    | _TransableCallableSync[Input, PhotoType]
+    | _TransableCallableAsync[Input, PhotoType]
+    | _TransableCallableIterator[Input, PhotoType]
+    | _TransableCallableAsyncIterator[Input, PhotoType]
+)
+
+
+def coerce_to_transable(
+    obj: TransableLike,
+) -> Transable[Input, PhotoType]:
+    """Coerce a Transable-like object into a Transable.
+
+    Args:
+        obj: A Transable-like object.
+
+    Returns:
+        A Transable.
+
+    Raises:
+        TypeError: If the object is not Transable-like.
+    """
+    if isinstance(obj, Transable):
+        return obj
+    if is_async_generator(obj) or inspect.isgeneratorfunction(obj):
+        return TransableLambda(cast("TransableFuncType", obj))
+    if callable(obj):
+        return TransableLambda(cast("Callable[[Input], PhotoType]", obj))
+    msg = (
+        f"Expected a Transable, callable or dict."
+        f"Instead got an unsupported type: {type(obj)}"
+    )
+    raise TypeError(msg)
