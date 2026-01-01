@@ -212,7 +212,7 @@ async def acall_func_with_variable_args(
     """
     if accepts_config(func):
         kwargs["config"] = config
-    if accepts_receive(func) and not isinstance(all_receive, Iterator):
+    if accepts_receive(func) and not isinstance(all_receive, Iterator | AsyncIterator):
         kwargs["receive"] = all_receive
     elif accepts_receives(func) and (
         isinstance(all_receive, Iterator | AsyncIterator) or all_receive is None

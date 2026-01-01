@@ -371,8 +371,10 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
 
     def _validate_chain(self) -> None:
         previous = self.start
+        sequence_input_type = self.start.InputType
         for transable in self.chains[1:]:
             ensure_subclass(transable.PhotoType, previous.PhotoType)
+            self._ensure_input_compatibility(transable, sequence_input_type)
             previous = transable
 
     def _pipe(
@@ -402,6 +404,26 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
                     yield result
 
         return _gen()
+
+    def _ensure_input_compatibility(
+        self,
+        transable: Transable[Any, Any],
+        sequence_input_type: type[Input],
+    ) -> None:
+        """Ensure each step can accept the sequence input type."""
+        target_input_type = transable.InputType
+        if sequence_input_type is Any or target_input_type is Any:
+            return
+        if (
+            inspect.isclass(sequence_input_type)
+            and inspect.isclass(target_input_type)
+            and not issubclass(sequence_input_type, target_input_type)
+        ):
+            raise TypeError(
+                f"InputType mismatch for {transable.get_name()}: "
+                f"{target_input_type.__name__} expected, "
+                f"got {sequence_input_type.__name__}."
+            )
 
 
 class TransableParallel(TransableSerializable[Input, PhotoType]):
@@ -731,6 +753,12 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
             results = [
                 coerce_photo(res, self.PhotoType) for res in results if res is not None
             ]
+            if not results:
+                if receive is not None:
+                    return coerce_photo(receive, self.PhotoType)
+                raise ValueError(
+                    "TransableLambda generator produced no results and no prior receive value."
+                )
             if len(results) == 1:
                 output = results[0]
             try:
