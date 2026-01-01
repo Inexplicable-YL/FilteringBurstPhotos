@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
-from collections.abc import AsyncIterator
-
-import anyio
 from typing_extensions import override
 
-from core.streamables.models import Photo, PhotoResult
-from core.streamables.base import Streamable, StreamableConfig
+import anyio
+
 from core.load.utils import aload_photo, collect_paths
+from core.transables.base import Transable, TransableConfig
+from core.transables.models import Photo, PhotoResult
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -37,7 +37,7 @@ def _grouping_sort_key(photo: Photo) -> tuple[datetime, str]:
     return (photo.taken_time, photo.path.name)
 
 
-class StreamLoader(Streamable[Photo, LoadInput]):
+class StreamLoader(Transable[Photo, LoadInput]):
     """Stream photos while grouping incrementally by time and pHash."""
 
     def __init__(
@@ -65,7 +65,7 @@ class StreamLoader(Streamable[Photo, LoadInput]):
         self,
         input: LoadInput,
         receive: PhotoResult[Photo] | None = None,
-        config: StreamableConfig | None = None,
+        config: TransableConfig | None = None,
         **kwargs: object,
     ) -> PhotoResult[Photo]:
         last: PhotoResult[Photo] | None = None
@@ -80,7 +80,7 @@ class StreamLoader(Streamable[Photo, LoadInput]):
         self,
         input: LoadInput,
         receives: AsyncIterator[PhotoResult[Photo]] | None = None,
-        config: StreamableConfig | None = None,
+        config: TransableConfig | None = None,
         **kwargs: object,
     ) -> AsyncIterator[PhotoResult[Photo]]:
         """Yield grouping snapshots while photos are loaded and hashed."""
@@ -239,9 +239,7 @@ class StreamLoader(Streamable[Photo, LoadInput]):
             photos=sorted(batch, key=_grouping_sort_key),
         )
 
-    def _resolve_max_concurrency(
-        self, config: StreamableConfig | None
-    ) -> int | None:
+    def _resolve_max_concurrency(self, config: TransableConfig | None) -> int | None:
         if config is None or "max_concurrency" not in config:
             return self.max_concurrency
         max_concurrency = config["max_concurrency"]

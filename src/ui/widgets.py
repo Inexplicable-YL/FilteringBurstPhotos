@@ -35,7 +35,7 @@ from ui.constants import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from core.streamables.models import Group, Photo
+    from core.transables.models import Group, Photo
 
 
 class LeftContainer(QWidget):

@@ -9,7 +9,7 @@ import anyio
 from anyio import to_thread
 from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
 
-from core.streamables.models import Photo
+from core.transables.models import Photo
 from core.hashing.phash import aphash
 
 if TYPE_CHECKING:

@@ -47,7 +47,7 @@ from ui.widgets import (
 
 if TYPE_CHECKING:
     from config.settings import Settings
-    from core.streamables.models import Group, Photo
+    from core.transables.models import Group, Photo
 
 logger = logging.getLogger(__name__)
 

@@ -9,7 +9,7 @@ import anyio
 
 from core.hashing.phash import hamming_distance
 from core.load.utils import aload_photo, collect_paths
-from core.streamables.models import Group, GroupingResult, Photo
+from core.transables.models import Group, GroupingResult, Photo
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator

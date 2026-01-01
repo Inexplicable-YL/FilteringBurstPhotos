@@ -1,13 +1,9 @@
 from datetime import datetime
-from hashlib import sha256
 from pathlib import Path
-from typing import Generic, Self, TypeVar, get_args
+from typing import Self
 
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
-
-PhotoType = TypeVar("PhotoType", bound="Photo")
-OtherPhotoType = TypeVar("OtherPhotoType", bound="Photo")
 
 
 class Photo(BaseModel):
@@ -31,6 +27,7 @@ class Photo(BaseModel):
     taken_time: datetime
     format: str
     keep: bool = True
+    metadata: dict = Field(default_factory=dict)
 
     @property
     def PhotoType(self) -> type[Self]:
@@ -70,42 +67,6 @@ class Photo(BaseModel):
     def get_unique_id(self) -> str:
         """Get a unique ID for this photo based on its path and ID."""
         return f"{self.get_type()}-{self.id}-{str(self.path)}"
-
-
-class PhotoResult(BaseModel, Generic[PhotoType]):
-    """Snapshot returned by the streaming grouping pipeline."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    photos: list[PhotoType] = Field(default_factory=list)
-    metadata: dict = Field(default_factory=dict)
-
-    @property
-    def PhotosType(self) -> type[PhotoType]:
-        """The type of Photo this PhotoResult contains."""
-        # First loop through bases -- this will help generic
-        # any pydantic models.
-        for base in self.__class__.mro():
-            if hasattr(base, "__pydantic_generic_metadata__"):
-                metadata = base.__pydantic_generic_metadata__
-                if "args" in metadata and len(metadata["args"]) == 1:
-                    return metadata["args"][0]
-
-        for cls in self.__class__.__orig_bases__:  # type: ignore[attr-defined]
-            type_args = get_args(cls)
-            if type_args and len(type_args) == 1:
-                return type_args[0]
-
-        raise TypeError("Could not determine PhotoType for PhotoResult.")
-
-    def get_unique_id(self, strict: bool = False) -> str | None:
-        """Unique ID of the first photo, if available."""
-        if self.photos:
-            ids = [photo.get_unique_id() for photo in self.photos]
-            if strict:
-                return sha256(str(ids).encode("utf-8")).hexdigest()
-            return sha256(str(sorted(ids)).encode("utf-8")).hexdigest()
-        return None
 
 
 class Group(BaseModel):
