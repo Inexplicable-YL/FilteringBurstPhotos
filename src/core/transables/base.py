@@ -25,7 +25,13 @@ from typing_extensions import override
 import anyio
 from pydantic import ConfigDict, Field
 
-from core.transables.config import TransableConfig
+from core.transables.config import (
+    TransableConfig,
+    ensure_config,
+    merge_configs,
+    patch_config,
+    set_config_context,
+)
 from core.transables.serializable import (
     Serializable,
     SerializedConstructor,
@@ -40,6 +46,8 @@ from core.transables.utils import (
     clone_photo,
     coerce_photo,
     ensure_subclass,
+    get_lambda_source,
+    indent_lines_after_first,
     is_async_callable,
     is_async_generator,
     is_generator,
@@ -208,11 +216,25 @@ class Transable(ABC, Generic[Input, PhotoType]):
         **kwargs: Any,
     ) -> AsyncIterator[PhotoType]:
         """Consume a stream of inputs and yield streaming results."""
-        if receives is None:
-            yield await self.invoke(input, config=config, **kwargs)
-            return
-        async for item in receives:
-            yield await self.invoke(input, item, config=config, **kwargs)
+        config = ensure_config(config)
+        with set_config_context(config) as context:
+            if receives is None:
+                yield await context.run(
+                    self.invoke,
+                    input,
+                    None,
+                    config,
+                    **kwargs,
+                )
+                return
+            async for item in receives:
+                yield await context.run(
+                    self.invoke,
+                    input,
+                    item,
+                    config,
+                    **kwargs,
+                )
 
     async def batch(
         self,
@@ -222,24 +244,37 @@ class Transable(ABC, Generic[Input, PhotoType]):
         **kwargs: Any,
     ) -> list[PhotoType]:
         """Consume a batch of inputs and return a list of results."""
+        config = ensure_config(config)
 
         async def _receives_iter() -> AsyncIterator[PhotoType]:
             for item in receives or []:
                 yield coerce_photo(item, self.PhotoType)
 
-        return [
-            item
-            async for item in self.stream(
+        with set_config_context(config) as context:
+            stream_iter = context.run(
+                self.stream,
                 input,
                 None if receives is None else _receives_iter(),
-                config=config,
+                config,
                 **kwargs,
             )
-        ]
+            return [item async for item in stream_iter]
 
     def bind(self, **kwargs: Any) -> Transable[Input, PhotoType]:
         """Return a bound transable with pre-applied kwargs."""
         return TransableBinding(bound=self, kwargs=kwargs, config={})
+
+    def with_config(
+        self,
+        config: TransableConfig | None = None,
+        **kwargs: Any,
+    ) -> Transable[Input, PhotoType]:
+        """Bind config to a Transable, returning a new Transable."""
+        return TransableBinding(
+            bound=self,
+            config=cast("TransableConfig", {**(config or {}), **kwargs}),
+            kwargs={},
+        )
 
 
 class TransableSerializable(Serializable, Transable[Input, PhotoType]):
@@ -377,6 +412,13 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         )
 
     @override
+    def __repr__(self) -> str:
+        return "\n| ".join(
+            repr(step) if i == 0 else indent_lines_after_first(repr(step), "| ")
+            for i, step in enumerate(self.chains)
+        )
+
+    @override
     async def invoke(
         self,
         input: Input,
@@ -384,9 +426,17 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         config: TransableConfig | None = None,
         **kwargs: Any,
     ) -> PhotoType:
+        config = ensure_config(config)
         current = receive
-        for transable in self.chains:
-            current = await transable.invoke(input, current, config=config, **kwargs)
+        with set_config_context(config) as context:
+            for transable in self.chains:
+                current = await context.run(
+                    transable.invoke,
+                    input,
+                    current,
+                    config,
+                    **kwargs,
+                )
         return cast("PhotoType", current)
 
     @override
@@ -397,11 +447,18 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         config: TransableConfig | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[PhotoType]:
-        upstream: AsyncIterator[Any] = self.start.stream(input, receives, config)
-        for transable in self.chains[1:]:
-            upstream = self._pipe(transable, upstream, input, config)
-        async for result in upstream:
-            yield cast("PhotoType", result)
+        config = ensure_config(config)
+        with set_config_context(config) as context:
+            upstream: AsyncIterator[Any] = context.run(
+                self.start.stream,
+                input,
+                receives,
+                config,
+            )
+            for transable in self.chains[1:]:
+                upstream = self._pipe(transable, upstream, input, config)
+            async for result in upstream:
+                yield cast("PhotoType", result)
 
     def _validate_chain(self) -> None:
         previous = self.start
@@ -418,7 +475,8 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         input: Input,
         config: TransableConfig | None = None,
     ) -> AsyncIterator[Any]:
-        buffer_size = stream_buffer(config)
+        ensured_config = ensure_config(config)
+        buffer_size = stream_buffer(ensured_config)
 
         async def _gen() -> AsyncIterator[Any]:
             send, recv = anyio.create_memory_object_stream[Any](
@@ -434,8 +492,15 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
 
             async with anyio.create_task_group() as tg, recv:
                 tg.start_soon(_produce)
-                async for result in downstream.stream(input, recv, config):
-                    yield result
+                with set_config_context(ensured_config) as context:
+                    stream_iter = context.run(
+                        downstream.stream,
+                        input,
+                        recv,
+                        ensured_config,
+                    )
+                    async for result in stream_iter:
+                        yield result
 
         return _gen()
 
@@ -495,6 +560,13 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         return self.steps[0].InputType
 
     @override
+    def __repr__(self) -> str:
+        return "\n& ".join(
+            repr(step) if i == 0 else indent_lines_after_first(repr(step), "& ")
+            for i, step in enumerate(self.steps)
+        )
+
+    @override
     async def invoke(
         self,
         input: Input,
@@ -502,6 +574,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         config: TransableConfig | None = None,
         **kwargs: Any,
     ) -> PhotoType:
+        config = ensure_config(config)
         if receive is None:
             raise ValueError(
                 "Parallel Transables require an input PhotoResult when invoked."
@@ -510,9 +583,14 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         results: list[PhotoType | None] = [None] * len(self.steps)
 
         async def _run(idx: int, step: Transable[Input, PhotoType]) -> None:
-            res = await step.invoke(
-                input, clone_photo(upstream), config=config, **kwargs
-            )
+            with set_config_context(config) as context:
+                res = await context.run(
+                    step.invoke,
+                    input,
+                    clone_photo(upstream),
+                    config,
+                    **kwargs,
+                )
             results[idx] = coerce_photo(res, self.PhotoType)
 
         async with anyio.create_task_group() as tg:
@@ -532,6 +610,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         config: TransableConfig | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[PhotoType]:
+        config = ensure_config(config)
         if receives is None:
             raise ValueError(
                 "Parallel Transables require an input PhotoResult stream when streamed."
@@ -570,13 +649,20 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         async def _run_step(idx: int, step: Transable[Input, PhotoType]) -> None:
             try:
                 async with child_recvs[idx]:
-                    async for result in step.stream(input, child_recvs[idx], config):
-                        coerced = coerce_photo(result, self.PhotoType)
-                        async with outpot_cond:
-                            step_outputs[coerced.get_unique_id()][idx] = clone_photo(
-                                coerced
-                            )
-                            outpot_cond.notify_all()
+                    with set_config_context(config) as context:
+                        stream_iter = context.run(
+                            step.stream,
+                            input,
+                            child_recvs[idx],
+                            config,
+                        )
+                        async for result in stream_iter:
+                            coerced = coerce_photo(result, self.PhotoType)
+                            async with outpot_cond:
+                                step_outputs[coerced.get_unique_id()][idx] = clone_photo(
+                                    coerced
+                                )
+                                outpot_cond.notify_all()
             finally:
                 async with outpot_cond:
                     step_done[idx] = True
@@ -692,6 +778,8 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         except AttributeError:
             pass
 
+        self._repr: str | None = None
+
     @property
     @override
     def InputType(self) -> Any:
@@ -730,6 +818,20 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         return Any
 
     @override
+    def __repr__(self) -> str:
+        if self._repr is None:
+            if hasattr(self, "func"):
+                self._repr = f"TransableLambda({get_lambda_source(self.func) or '...'})"
+            elif hasattr(self, "stream_func"):
+                self._repr = (
+                    "TransableLambda(stream_func="
+                    f"{get_lambda_source(self.stream_func) or '...'})"
+                )
+            else:
+                self._repr = "TransableLambda(...)"
+        return self._repr
+
+    @override
     async def invoke(
         self,
         input: Input,
@@ -737,6 +839,7 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         config: TransableConfig | None = None,
         **kwargs: Any,
     ) -> PhotoType:
+        config = ensure_config(config)
         if hasattr(self, "func"):
             return await self._invoke(input, receive, config, **kwargs)
 
@@ -752,6 +855,7 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         config: TransableConfig | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[PhotoType]:
+        config = ensure_config(config)
         if hasattr(self, "stream_func"):
             async for res in self._stream(input, receives, config, **kwargs):
                 yield res
@@ -769,6 +873,7 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         config: TransableConfig | None,
         **kwargs: Any,
     ) -> Any:
+        config = ensure_config(config)
         if is_generator(self.func) or is_async_generator(self.func):
             output: PhotoType | None = None
             if is_generator(self.func):
@@ -827,10 +932,15 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
             )
 
         if isinstance(output, Transable):
+            recursion_limit = config["recursion_limit"]  # type: ignore
+            if recursion_limit <= 0:
+                raise RecursionError(
+                    f"Recursion limit reached when invoking {self} with input {input}."
+                )
             output = await output.invoke(
                 input,
                 receive,
-                config,
+                patch_config(config, recursion_limit=recursion_limit - 1),
                 **kwargs,
             )
 
@@ -944,13 +1054,11 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         )
 
     def _merge_configs(self, *configs: TransableConfig | None) -> TransableConfig:
-        merged: TransableConfig = {**self.config}
-        for conf in configs:
-            if conf:
-                merged = {**merged, **conf}
-        for factory in self.config_factories:
-            merged = factory(merged)
-        return merged
+        config = merge_configs(self.config, *configs)
+        return merge_configs(
+            config,
+            *(factory(config) for factory in self.config_factories),
+        )
 
     @override
     async def invoke(
@@ -961,12 +1069,14 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> PhotoType:
         merged_config = self._merge_configs(config)
-        return await self.bound.invoke(
-            input,
-            receive,
-            merged_config,
-            **{**self.kwargs, **kwargs},
-        )
+        with set_config_context(merged_config) as context:
+            return await context.run(
+                self.bound.invoke,
+                input,
+                receive,
+                merged_config,
+                **{**self.kwargs, **kwargs},
+            )
 
     @override
     async def stream(
@@ -977,13 +1087,16 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> AsyncIterator[PhotoType]:
         merged_config = self._merge_configs(config)
-        async for item in self.bound.stream(
-            input,
-            receives,
-            merged_config,
-            **{**self.kwargs, **kwargs},
-        ):
-            yield item
+        with set_config_context(merged_config) as context:
+            stream_iter = context.run(
+                self.bound.stream,
+                input,
+                receives,
+                merged_config,
+                **{**self.kwargs, **kwargs},
+            )
+            async for item in stream_iter:
+                yield item
 
     @override
     async def batch(
@@ -994,12 +1107,14 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> list[PhotoType]:
         merged_config = self._merge_configs(config)
-        return await self.bound.batch(
-            input,
-            receives,
-            merged_config,
-            **{**self.kwargs, **kwargs},
-        )
+        with set_config_context(merged_config) as context:
+            return await context.run(
+                self.bound.batch,
+                input,
+                receives,
+                merged_config,
+                **{**self.kwargs, **kwargs},
+            )
 
     @override
     def bind(self, **kwargs: Any) -> Transable[Input, PhotoType]:
@@ -1009,6 +1124,21 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
             config=self.config,
             config_factories=self.config_factories,
             kwargs={**self.kwargs, **kwargs},
+            custom_input_type=self.custom_input_type,
+            custom_photo_type=self.custom_photo_type,
+        )
+
+    @override
+    def with_config(
+        self,
+        config: TransableConfig | None = None,
+        **kwargs: Any,
+    ) -> Transable[Input, PhotoType]:
+        return self.__class__(
+            bound=self.bound,
+            kwargs=self.kwargs,
+            config=cast("TransableConfig", {**self.config, **(config or {}), **kwargs}),
+            config_factories=self.config_factories,
             custom_input_type=self.custom_input_type,
             custom_photo_type=self.custom_photo_type,
         )

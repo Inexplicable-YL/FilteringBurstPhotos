@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Iterator
+import textwrap
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -10,13 +12,15 @@ from typing import (
     TypeVar,
     cast,
 )
+from typing_extensions import override
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable
 
     from core.transables.config import TransableConfig
     from core.transables.models import Photo
 
+from core.transables.config import ensure_config, set_config_context
 
 Input = TypeVar("Input")
 OtherInput = TypeVar("OtherInput")
@@ -171,6 +175,7 @@ def call_func_with_variable_args(
     Returns:
         PhotoType: The result of the function call.
     """
+    config = ensure_config(config)
     if accepts_config(func):
         kwargs["config"] = config
     if accepts_receive(func) and not isinstance(all_receive, Iterator | AsyncIterator):
@@ -188,7 +193,8 @@ def call_func_with_variable_args(
 
             all_receive = async_wrapper(all_receive)
         kwargs["receives"] = all_receive
-    return func(input, **kwargs)  # type: ignore[arg-type]
+    with set_config_context(config) as context:
+        return context.run(func, input, **kwargs)  # type: ignore[arg-type]
 
 
 async def acall_func_with_variable_args(
@@ -214,6 +220,7 @@ async def acall_func_with_variable_args(
     Returns:
         PhotoType: The result of the function call.
     """
+    config = ensure_config(config)
     if accepts_config(func):
         kwargs["config"] = config
     if accepts_receive(func) and not isinstance(all_receive, Iterator | AsyncIterator):
@@ -231,7 +238,8 @@ async def acall_func_with_variable_args(
 
             all_receive = async_wrapper(all_receive)
         kwargs["receives"] = all_receive
-    return await func(input, **kwargs)  # type: ignore[arg-type]
+    with set_config_context(config) as context:
+        return await context.run(func, input, **kwargs)  # type: ignore[arg-type]
 
 
 def is_generator(func: Any) -> TypeGuard[Callable[..., Iterator]]:
@@ -283,3 +291,41 @@ def is_async_callable(
         hasattr(func, "__call__")  # noqa: B004
         and asyncio.iscoroutinefunction(func.__call__)
     )
+
+
+class _GetLambdaSource(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.source: str | None = None
+        self.count = 0
+
+    @override
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self.count += 1
+        if hasattr(ast, "unparse"):
+            self.source = ast.unparse(node)
+
+
+def get_lambda_source(func: Callable[..., Any]) -> str | None:
+    """Get the source code of a lambda function if available."""
+    try:
+        name = func.__name__ if func.__name__ != "<lambda>" else None
+    except AttributeError:
+        name = None
+    try:
+        code = inspect.getsource(func)
+        tree = ast.parse(textwrap.dedent(code))
+        visitor = _GetLambdaSource()
+        visitor.visit(tree)
+    except (SyntaxError, TypeError, OSError, SystemError):
+        return name
+    return visitor.source if visitor.count == 1 else name
+
+
+def indent_lines_after_first(text: str, prefix: str) -> str:
+    """Indent all lines after the first line based on the prefix length."""
+    n_spaces = len(prefix)
+    spaces = " " * n_spaces
+    lines = text.splitlines()
+    if not lines:
+        return text
+    return "\n".join([lines[0]] + [spaces + line for line in lines[1:]])
