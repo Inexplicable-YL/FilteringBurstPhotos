@@ -402,6 +402,46 @@ class Transable(ABC, Generic[Input, PhotoType]):
             kwargs={},
         )
 
+    async def _call_with_config(
+        self,
+        func: Callable[..., Awaitable[Any]],
+        input: Input,
+        receive_value: Any | None,
+        config: TransableConfig | None,
+        run_type: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        config = ensure_config(config)
+        return await arun_with_tracing(
+            self,
+            func,
+            input,
+            receive_value,
+            config,
+            run_type,
+            *args,
+            **kwargs,
+        )
+
+    def _stream_with_config(
+        self,
+        iterator: AsyncIterator[Any],
+        input: Input,
+        receive_value: Any | None,
+        config: TransableConfig | None,
+        run_type: str,
+    ) -> AsyncIterator[Any]:
+        config = ensure_config(config)
+        return aiter_with_tracing(
+            self,
+            iterator,
+            input,
+            receive_value,
+            config,
+            run_type,
+        )
+
 
 class TransableSerializable(Serializable, Transable[Input, PhotoType]):
     """Transable that can be serialized to JSON."""
@@ -574,8 +614,7 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
                 )
             return cast("PhotoType", current)
 
-        return await arun_with_tracing(
-            self,
+        return await self._call_with_config(
             _invoke_steps,
             input,
             receive,
@@ -601,8 +640,7 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         )
         for transable in self.chains[1:]:
             upstream = self._pipe(transable, upstream, input, config)
-        async for result in aiter_with_tracing(
-            self,
+        async for result in self._stream_with_config(
             upstream,
             input,
             receives,
@@ -775,8 +813,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
 
             return merge_photos(receive, [res for res in results if res is not None])
 
-        return await arun_with_tracing(
-            self,
+        return await self._call_with_config(
             _invoke_parallel,
             input,
             receive,
@@ -895,8 +932,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                 async for output in _collect_outputs():
                     yield output
 
-        async for output in aiter_with_tracing(
-            self,
+        async for output in self._stream_with_config(
             _stream_outputs(),
             input,
             receives,
@@ -1081,8 +1117,7 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
     ) -> PhotoType:
         config = ensure_config(config)
         if hasattr(self, "func"):
-            return await arun_with_tracing(
-                self,
+            return await self._call_with_config(
                 self._invoke,
                 input,
                 receive,
@@ -1127,8 +1162,7 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
             async for item in receives:
                 yield await self.invoke(input, item, config, **kwargs)
 
-        async for res in aiter_with_tracing(
-            self,
+        async for res in self._stream_with_config(
             _stream_impl(),
             input,
             receives,
@@ -1348,8 +1382,7 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> PhotoType:
         merged_config = self._merge_configs(config)
-        return await arun_with_tracing(
-            self,
+        return await self._call_with_config(
             self.bound.invoke,
             input,
             receive,
@@ -1378,8 +1411,7 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
             merged_config,
             **{**self.kwargs, **kwargs},
         )
-        async for item in aiter_with_tracing(
-            self,
+        async for item in self._stream_with_config(
             stream_iter,
             input,
             receives,
@@ -1397,8 +1429,7 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> list[PhotoType]:
         merged_config = self._merge_configs(config)
-        return await arun_with_tracing(
-            self,
+        return await self._call_with_config(
             self.bound.batch,
             input,
             receives,
