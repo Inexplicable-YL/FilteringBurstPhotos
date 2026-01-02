@@ -20,7 +20,12 @@ if TYPE_CHECKING:
     from core.transables.config import TransableConfig
     from core.transables.models import Photo
 
-from core.transables.config import ensure_config, set_config_context
+from core.transables.config import (
+    DEFAULT_STREAM_BUFFER,
+    arun_in_context,
+    ensure_config,
+    run_in_context,
+)
 
 Input = TypeVar("Input")
 OtherInput = TypeVar("OtherInput")
@@ -30,9 +35,8 @@ OtherPhotoType = TypeVar("OtherPhotoType", bound="Photo")
 
 
 def stream_buffer(config: TransableConfig | None) -> int:
-    if config is None:
-        return 64
-    return max(1, int(config.get("stream_buffer", 64)))
+    config = ensure_config(config)
+    return max(1, int(config.get("stream_buffer", DEFAULT_STREAM_BUFFER)))
 
 
 def ensure_subclass(child: type[Photo], parent: type[Photo]) -> None:
@@ -193,8 +197,7 @@ def call_func_with_variable_args(
 
             all_receive = async_wrapper(all_receive)
         kwargs["receives"] = all_receive
-    with set_config_context(config) as context:
-        return context.run(func, input, **kwargs)  # type: ignore[arg-type]
+    return run_in_context(config, func, input, **kwargs)  # type: ignore[arg-type]
 
 
 async def acall_func_with_variable_args(
@@ -238,8 +241,7 @@ async def acall_func_with_variable_args(
 
             all_receive = async_wrapper(all_receive)
         kwargs["receives"] = all_receive
-    with set_config_context(config) as context:
-        return await context.run(func, input, **kwargs)  # type: ignore[arg-type]
+    return await arun_in_context(config, func, input, **kwargs)  # type: ignore[arg-type]
 
 
 def is_generator(func: Any) -> TypeGuard[Callable[..., Iterator]]:
@@ -329,3 +331,132 @@ def indent_lines_after_first(text: str, prefix: str) -> str:
     if not lines:
         return text
     return "\n".join([lines[0]] + [spaces + line for line in lines[1:]])
+
+
+class IsLocalDict(ast.NodeVisitor):
+    """Check if a name is a local dict."""
+
+    def __init__(self, name: str, keys: set[str]) -> None:
+        """Initialize the visitor.
+
+        Args:
+            name: The name to check.
+            keys: The keys to populate.
+        """
+        self.name = name
+        self.keys = keys
+
+    @override
+    def visit_Subscript(self, node: ast.Subscript) -> Any:
+        """Visit a subscript node.
+
+        Args:
+            node: The node to visit.
+
+        Returns:
+            Any: The result of the visit.
+        """
+        if (
+            isinstance(node.ctx, ast.Load)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == self.name
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+        ):
+            # we've found a subscript access on the name we're looking for
+            self.keys.add(node.slice.value)
+
+    @override
+    def visit_Call(self, node: ast.Call) -> Any:
+        """Visit a call node.
+
+        Args:
+            node: The node to visit.
+
+        Returns:
+            Any: The result of the visit.
+        """
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == self.name
+            and node.func.attr == "get"
+            and len(node.args) in (1, 2)
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            # we've found a .get() call on the name we're looking for
+            self.keys.add(node.args[0].value)
+
+
+class IsFunctionArgDict(ast.NodeVisitor):
+    """Check if the first argument of a function is a dict."""
+
+    def __init__(self) -> None:
+        """Create a IsFunctionArgDict visitor."""
+        self.keys: set[str] = set()
+
+    @override
+    def visit_Lambda(self, node: ast.Lambda) -> Any:
+        """Visit a lambda function.
+
+        Args:
+            node: The node to visit.
+
+        Returns:
+            Any: The result of the visit.
+        """
+        if not node.args.args:
+            return
+        input_arg_name = node.args.args[0].arg
+        IsLocalDict(input_arg_name, self.keys).visit(node.body)
+
+    @override
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
+        """Visit a function definition.
+
+        Args:
+            node: The node to visit.
+
+        Returns:
+            Any: The result of the visit.
+        """
+        if not node.args.args:
+            return
+        input_arg_name = node.args.args[0].arg
+        IsLocalDict(input_arg_name, self.keys).visit(node)
+
+    @override
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> Any:
+        """Visit an async function definition.
+
+        Args:
+            node: The node to visit.
+
+        Returns:
+            Any: The result of the visit.
+        """
+        if not node.args.args:
+            return
+        input_arg_name = node.args.args[0].arg
+        IsLocalDict(input_arg_name, self.keys).visit(node)
+
+
+def get_function_first_arg_dict_keys(func: Callable) -> list[str] | None:
+    """Get the keys of the first argument of a function if it is a dict.
+
+    Args:
+        func: The function to check.
+
+    Returns:
+        Optional[list[str]]: The keys of the first argument if it is a dict,
+            None otherwise.
+    """
+    try:
+        code = inspect.getsource(func)
+        tree = ast.parse(textwrap.dedent(code))
+        visitor = IsFunctionArgDict()
+        visitor.visit(tree)
+        return sorted(visitor.keys) if visitor.keys else None
+    except (SyntaxError, TypeError, OSError, SystemError):
+        return None

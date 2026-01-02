@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-from collections.abc import Generator, Sequence
+from collections.abc import Awaitable, Callable, Generator, Sequence
 from contextlib import contextmanager
 from contextvars import Context, ContextVar, copy_context
 from typing import (
     Any,
+    ParamSpec,
     TypedDict,
     TypeVar,
     cast,
 )
 
-Input = TypeVar("Input")
+from pydantic import BaseModel, ConfigDict, Field
+
+P = ParamSpec("P")
+Output = TypeVar("Output")
 
 
 class TransableConfig(TypedDict, total=False):
@@ -45,6 +49,19 @@ var_child_transable_config: ContextVar[TransableConfig | None] = ContextVar(
     "child_transable_config",
     default=None,
 )
+
+
+class TransableConfigModel(BaseModel):
+    """Pydantic model for TransableConfig validation and schemas."""
+
+    model_config = ConfigDict(extra="allow")
+
+    run_name: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    max_concurrency: int | None = None
+    stream_buffer: int = DEFAULT_STREAM_BUFFER
+    recursion_limit: int = DEFAULT_RECURSION_LIMIT
 
 
 def _copy_config_values(config: TransableConfig) -> TransableConfig:
@@ -150,3 +167,25 @@ def merge_configs(*configs: TransableConfig | None) -> TransableConfig:
             else:
                 base[key] = value
     return base
+
+
+def run_in_context(
+    config: TransableConfig,
+    func: Callable[P, Output],
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> Output:
+    """Run a callable with a normalized config bound to the context."""
+    with set_config_context(config) as context:
+        return context.run(func, *args, **kwargs)
+
+
+async def arun_in_context(
+    config: TransableConfig,
+    func: Callable[P, Awaitable[Output]],
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> Output:
+    """Run an async callable with a normalized config bound to the context."""
+    with set_config_context(config) as context:
+        return await context.run(func, *args, **kwargs)

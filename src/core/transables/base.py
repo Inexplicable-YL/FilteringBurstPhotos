@@ -12,6 +12,8 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from operator import itemgetter
+from types import GenericAlias
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -23,14 +25,16 @@ from typing import (
 from typing_extensions import override
 
 import anyio
-from pydantic import ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from core.transables.config import (
     TransableConfig,
+    TransableConfigModel,
+    arun_in_context,
     ensure_config,
     merge_configs,
     patch_config,
-    set_config_context,
+    run_in_context,
 )
 from core.transables.serializable import (
     Serializable,
@@ -46,6 +50,7 @@ from core.transables.utils import (
     clone_photo,
     coerce_photo,
     ensure_subclass,
+    get_function_first_arg_dict_keys,
     get_lambda_source,
     indent_lines_after_first,
     is_async_callable,
@@ -142,6 +147,79 @@ class Transable(ABC, Generic[Input, PhotoType]):
         )
         raise TypeError(msg)
 
+    @property
+    def input_schema(self) -> type[BaseModel]:
+        """The type of input this Runnable accepts specified as a pydantic model."""
+        return self.get_input_schema()
+
+    def get_input_schema(
+        self,
+        config: TransableConfig | None = None,  # noqa: ARG002
+    ) -> type[BaseModel]:
+        """Get a pydantic model that can be used to validate input to the Runnable.
+
+        Runnables that leverage the configurable_fields and configurable_alternatives
+        methods will have a dynamic input schema that depends on which
+        configuration the Runnable is invoked with.
+
+        This method allows to get an input schema for a specific configuration.
+
+        Args:
+            config: A config to use when generating the schema.
+
+        Returns:
+            A pydantic model that can be used to validate input.
+        """
+        root_type = self.InputType
+
+        if (
+            inspect.isclass(root_type)
+            and not isinstance(root_type, GenericAlias)
+            and issubclass(root_type, BaseModel)
+        ):
+            return root_type
+
+        return create_model(
+            self.get_name("Input"),
+            root=root_type,
+            # create model needs access to appropriate type annotations to be
+            # able to construct the pydantic model.
+            # When we create the model, we pass information about the namespace
+            # where the model is being created, so the type annotations can
+            # be resolved correctly as well.
+            # self.__class__.__module__ handles the case when the Runnable is
+            # being sub-classed in a different module.
+            module_name=self.__class__.__module__,
+        )
+
+    def get_input_jsonschema(
+        self, config: TransableConfig | None = None
+    ) -> dict[str, Any]:
+        """Get a JSON schema that represents the input to the Runnable.
+
+        Args:
+            config: A config to use when generating the schema.
+
+        Returns:
+            A JSON schema that represents the input to the Runnable.
+
+        Example:
+
+            .. code-block:: python
+
+                from langchain_core.runnables import RunnableLambda
+
+                def add_one(x: int) -> int:
+                    return x + 1
+
+                runnable = RunnableLambda(add_one)
+
+                print(runnable.get_input_jsonschema())
+
+        .. versionadded:: 0.3.0
+        """
+        return self.get_input_schema(config).model_json_schema()
+
     def __or__(
         self,
         other: Transable[Any, OtherPhotoType]
@@ -192,7 +270,7 @@ class Transable(ABC, Generic[Input, PhotoType]):
 
     def parallel(
         self,
-        *others: Transable[Input, PhotoType],
+        *others: Transable[Input, PhotoType] | Callable[[Any], OtherPhotoType],
     ) -> TransableSerializable[Input, PhotoType]:
         """"""
         return TransableParallel(self, *others)
@@ -217,24 +295,25 @@ class Transable(ABC, Generic[Input, PhotoType]):
     ) -> AsyncIterator[PhotoType]:
         """Consume a stream of inputs and yield streaming results."""
         config = ensure_config(config)
-        with set_config_context(config) as context:
-            if receives is None:
-                yield await context.run(
-                    self.invoke,
-                    input,
-                    None,
-                    config,
-                    **kwargs,
-                )
-                return
-            async for item in receives:
-                yield await context.run(
-                    self.invoke,
-                    input,
-                    item,
-                    config,
-                    **kwargs,
-                )
+        if receives is None:
+            yield await arun_in_context(
+                config,
+                self.invoke,
+                input,
+                None,
+                config,
+                **kwargs,
+            )
+            return
+        async for item in receives:
+            yield await arun_in_context(
+                config,
+                self.invoke,
+                input,
+                item,
+                config,
+                **kwargs,
+            )
 
     async def batch(
         self,
@@ -250,19 +329,27 @@ class Transable(ABC, Generic[Input, PhotoType]):
             for item in receives or []:
                 yield coerce_photo(item, self.PhotoType)
 
-        with set_config_context(config) as context:
-            stream_iter = context.run(
-                self.stream,
-                input,
-                None if receives is None else _receives_iter(),
-                config,
-                **kwargs,
-            )
-            return [item async for item in stream_iter]
+        stream_iter = run_in_context(
+            config,
+            self.stream,
+            input,
+            None if receives is None else _receives_iter(),
+            config,
+            **kwargs,
+        )
+        return [item async for item in stream_iter]
 
     def bind(self, **kwargs: Any) -> Transable[Input, PhotoType]:
         """Return a bound transable with pre-applied kwargs."""
         return TransableBinding(bound=self, kwargs=kwargs, config={})
+
+    def config_schema(self) -> type[BaseModel]:
+        """Return the Pydantic model for TransableConfig."""
+        return TransableConfigModel
+
+    def get_config_jsonschema(self) -> dict[str, Any]:
+        """Return the JSON schema for TransableConfig."""
+        return self.config_schema().model_json_schema()
 
     def with_config(
         self,
@@ -348,6 +435,15 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         """The type of the output of the Transable."""
         return self.end.PhotoType
 
+    @override
+    def get_input_schema(
+        self, config: TransableConfig | None = None
+    ) -> type[BaseModel]:
+        first = self.chains[0]
+        if len(self.chains) == 1:
+            return first.get_input_schema(config)
+        return first.get_input_schema(config)
+
     @property
     def chains(self) -> list[Transable[Any, Any]]:
         """All the Transables that make up the sequence in order.
@@ -428,15 +524,15 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
     ) -> PhotoType:
         config = ensure_config(config)
         current = receive
-        with set_config_context(config) as context:
-            for transable in self.chains:
-                current = await context.run(
-                    transable.invoke,
-                    input,
-                    current,
-                    config,
-                    **kwargs,
-                )
+        for transable in self.chains:
+            current = await arun_in_context(
+                config,
+                transable.invoke,
+                input,
+                current,
+                config,
+                **kwargs,
+            )
         return cast("PhotoType", current)
 
     @override
@@ -448,17 +544,17 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> AsyncIterator[PhotoType]:
         config = ensure_config(config)
-        with set_config_context(config) as context:
-            upstream: AsyncIterator[Any] = context.run(
-                self.start.stream,
-                input,
-                receives,
-                config,
-            )
-            for transable in self.chains[1:]:
-                upstream = self._pipe(transable, upstream, input, config)
-            async for result in upstream:
-                yield cast("PhotoType", result)
+        upstream: AsyncIterator[Any] = run_in_context(
+            config,
+            self.start.stream,
+            input,
+            receives,
+            config,
+        )
+        for transable in self.chains[1:]:
+            upstream = self._pipe(transable, upstream, input, config)
+        async for result in upstream:
+            yield cast("PhotoType", result)
 
     def _validate_chain(self) -> None:
         previous = self.start
@@ -492,15 +588,15 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
 
             async with anyio.create_task_group() as tg, recv:
                 tg.start_soon(_produce)
-                with set_config_context(ensured_config) as context:
-                    stream_iter = context.run(
-                        downstream.stream,
-                        input,
-                        recv,
-                        ensured_config,
-                    )
-                    async for result in stream_iter:
-                        yield result
+                stream_iter = run_in_context(
+                    ensured_config,
+                    downstream.stream,
+                    input,
+                    recv,
+                    ensured_config,
+                )
+                async for result in stream_iter:
+                    yield result
 
         return _gen()
 
@@ -560,6 +656,28 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         return self.steps[0].InputType
 
     @override
+    def get_input_schema(
+        self, config: TransableConfig | None = None
+    ) -> type[BaseModel]:
+        if all(
+            s.get_input_schema(config).model_json_schema().get("type", "object")
+            == "object"
+            for s in self.steps
+        ):
+            # This is correct, but pydantic typings/mypy don't think so.
+            return create_model(
+                self.get_name("Input"),
+                field_definitions={
+                    k: (v.annotation, v.default)
+                    for step in self.steps
+                    for k, v in step.get_input_schema(config).model_fields.items()
+                    if k != "__root__"
+                },
+            )
+
+        return super().get_input_schema(config)
+
+    @override
     def __repr__(self) -> str:
         return "\n& ".join(
             repr(step) if i == 0 else indent_lines_after_first(repr(step), "& ")
@@ -583,14 +701,14 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         results: list[PhotoType | None] = [None] * len(self.steps)
 
         async def _run(idx: int, step: Transable[Input, PhotoType]) -> None:
-            with set_config_context(config) as context:
-                res = await context.run(
-                    step.invoke,
-                    input,
-                    clone_photo(upstream),
-                    config,
-                    **kwargs,
-                )
+            res = await arun_in_context(
+                config,
+                step.invoke,
+                input,
+                clone_photo(upstream),
+                config,
+                **kwargs,
+            )
             results[idx] = coerce_photo(res, self.PhotoType)
 
         async with anyio.create_task_group() as tg:
@@ -649,20 +767,20 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         async def _run_step(idx: int, step: Transable[Input, PhotoType]) -> None:
             try:
                 async with child_recvs[idx]:
-                    with set_config_context(config) as context:
-                        stream_iter = context.run(
-                            step.stream,
-                            input,
-                            child_recvs[idx],
-                            config,
-                        )
-                        async for result in stream_iter:
-                            coerced = coerce_photo(result, self.PhotoType)
-                            async with outpot_cond:
-                                step_outputs[coerced.get_unique_id()][idx] = clone_photo(
-                                    coerced
-                                )
-                                outpot_cond.notify_all()
+                    stream_iter = run_in_context(
+                        config,
+                        step.stream,
+                        input,
+                        child_recvs[idx],
+                        config,
+                    )
+                    async for result in stream_iter:
+                        coerced = coerce_photo(result, self.PhotoType)
+                        async with outpot_cond:
+                            step_outputs[coerced.get_unique_id()][idx] = clone_photo(
+                                coerced
+                            )
+                            outpot_cond.notify_all()
             finally:
                 async with outpot_cond:
                     step_done[idx] = True
@@ -818,6 +936,51 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         return Any
 
     @override
+    def get_input_schema(
+        self, config: TransableConfig | None = None
+    ) -> type[BaseModel]:
+        """The pydantic schema for the input to this Runnable.
+
+        Args:
+            config: The config to use. Defaults to None.
+
+        Returns:
+            The input schema for this Runnable.
+        """
+        func = getattr(self, "func", None) or self.stream_func
+
+        if isinstance(func, itemgetter):
+            # This is terrible, but afaict it's not possible to access _items
+            # on itemgetter objects, so we have to parse the repr
+            items = str(func).replace("operator.itemgetter(", "")[:-1].split(", ")
+            if all(
+                item[0] == "'" and item[-1] == "'" and len(item) > 2 for item in items
+            ):
+                fields = {item[1:-1]: (Any, ...) for item in items}
+                # It's a dict, lol
+                return create_model(self.get_name("Input"), field_definitions=fields)
+            module = getattr(func, "__module__", None)
+            return create_model(
+                self.get_name("Input"),
+                root=list[Any],
+                # To create the schema, we need to provide the module
+                # where the underlying function is defined.
+                # This allows pydantic to resolve type annotations appropriately.
+                module_name=module,
+            )
+
+        if self.InputType != Any:
+            return super().get_input_schema(config)
+
+        if dict_keys := get_function_first_arg_dict_keys(func):
+            return create_model(
+                self.get_name("Input"),
+                field_definitions=dict.fromkeys(dict_keys, (Any, ...)),
+            )
+
+        return super().get_input_schema(config)
+
+    @override
     def __repr__(self) -> str:
         if self._repr is None:
             if hasattr(self, "func"):
@@ -841,7 +1004,14 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
     ) -> PhotoType:
         config = ensure_config(config)
         if hasattr(self, "func"):
-            return await self._invoke(input, receive, config, **kwargs)
+            return await arun_in_context(
+                config,
+                self._invoke,
+                input,
+                receive,
+                config,
+                **kwargs,
+            )
 
         raise TypeError(
             "Cannot use invoke when only stream_func is defined.Please use stream instead."
@@ -857,7 +1027,15 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
     ) -> AsyncIterator[PhotoType]:
         config = ensure_config(config)
         if hasattr(self, "stream_func"):
-            async for res in self._stream(input, receives, config, **kwargs):
+            stream_iter = run_in_context(
+                config,
+                self._stream,
+                input,
+                receives,
+                config,
+                **kwargs,
+            )
+            async for res in stream_iter:
                 yield res
             return
         if receives is None:
@@ -1053,6 +1231,14 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
             else self.bound.PhotoType
         )
 
+    @override
+    def get_input_schema(
+        self, config: TransableConfig | None = None
+    ) -> type[BaseModel]:
+        if self.custom_input_type is not None:
+            return super().get_input_schema(config)
+        return self.bound.get_input_schema(merge_configs(self.config, config))
+
     def _merge_configs(self, *configs: TransableConfig | None) -> TransableConfig:
         config = merge_configs(self.config, *configs)
         return merge_configs(
@@ -1069,14 +1255,14 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> PhotoType:
         merged_config = self._merge_configs(config)
-        with set_config_context(merged_config) as context:
-            return await context.run(
-                self.bound.invoke,
-                input,
-                receive,
-                merged_config,
-                **{**self.kwargs, **kwargs},
-            )
+        return await arun_in_context(
+            merged_config,
+            self.bound.invoke,
+            input,
+            receive,
+            merged_config,
+            **{**self.kwargs, **kwargs},
+        )
 
     @override
     async def stream(
@@ -1087,16 +1273,16 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> AsyncIterator[PhotoType]:
         merged_config = self._merge_configs(config)
-        with set_config_context(merged_config) as context:
-            stream_iter = context.run(
-                self.bound.stream,
-                input,
-                receives,
-                merged_config,
-                **{**self.kwargs, **kwargs},
-            )
-            async for item in stream_iter:
-                yield item
+        stream_iter = run_in_context(
+            merged_config,
+            self.bound.stream,
+            input,
+            receives,
+            merged_config,
+            **{**self.kwargs, **kwargs},
+        )
+        async for item in stream_iter:
+            yield item
 
     @override
     async def batch(
@@ -1107,14 +1293,14 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> list[PhotoType]:
         merged_config = self._merge_configs(config)
-        with set_config_context(merged_config) as context:
-            return await context.run(
-                self.bound.batch,
-                input,
-                receives,
-                merged_config,
-                **{**self.kwargs, **kwargs},
-            )
+        return await arun_in_context(
+            merged_config,
+            self.bound.batch,
+            input,
+            receives,
+            merged_config,
+            **{**self.kwargs, **kwargs},
+        )
 
     @override
     def bind(self, **kwargs: Any) -> Transable[Input, PhotoType]:
