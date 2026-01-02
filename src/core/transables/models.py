@@ -67,19 +67,3 @@ class Photo(BaseModel):
     def get_unique_id(self) -> str:
         """Get a unique ID for this photo based on its path and ID."""
         return f"{self.get_type()}-{self.id}-{str(self.path)}"
-
-
-class Group(BaseModel):
-    """Represents a burst group of photos."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    id: int
-    photos: list[Photo] = Field(default_factory=list)
-
-    @property
-    def representative(self) -> Photo | None:
-        return self.photos[0] if self.photos else None
-
-    def size(self) -> int:
-        return len(self.photos)
