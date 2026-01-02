@@ -41,6 +41,11 @@ from core.transables.serializable import (
     SerializedConstructor,
     SerializedNotImplemented,
 )
+from core.transables.tracing import (
+    TransableListener,
+    aiter_with_tracing,
+    arun_with_tracing,
+)
 from core.transables.utils import (
     Input,
     OtherInput,
@@ -351,6 +356,40 @@ class Transable(ABC, Generic[Input, PhotoType]):
         """Return the JSON schema for TransableConfig."""
         return self.config_schema().model_json_schema()
 
+    def with_listeners(
+        self,
+        *,
+        on_start: Callable[[Any, TransableConfig], None] | None = None,
+        on_end: Callable[[Any, TransableConfig], None] | None = None,
+        on_error: Callable[[Any, TransableConfig], None] | None = None,
+        on_stream_start: Callable[[Any, TransableConfig], None] | None = None,
+        on_stream_chunk: Callable[[Any, Any, TransableConfig], None] | None = None,
+        on_stream_end: Callable[[Any, TransableConfig], None] | None = None,
+        on_stream_error: Callable[[Any, TransableConfig], None] | None = None,
+    ) -> Transable[Input, PhotoType]:
+        """Bind lifecycle listeners to a Transable."""
+
+        listener = TransableListener(
+            on_start=on_start,
+            on_end=on_end,
+            on_error=on_error,
+            on_stream_start=on_stream_start,
+            on_stream_chunk=on_stream_chunk,
+            on_stream_end=on_stream_end,
+            on_stream_error=on_stream_error,
+        )
+
+        def listener_factory(_config: TransableConfig) -> TransableConfig:
+            return {
+                "callbacks": [listener],
+                "trace": True,
+            }
+
+        return TransableBinding(
+            bound=self,
+            config_factories=[listener_factory],
+        )
+
     def with_config(
         self,
         config: TransableConfig | None = None,
@@ -523,17 +562,26 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> PhotoType:
         config = ensure_config(config)
-        current = receive
-        for transable in self.chains:
-            current = await arun_in_context(
-                config,
-                transable.invoke,
-                input,
-                current,
-                config,
-                **kwargs,
-            )
-        return cast("PhotoType", current)
+
+        async def _invoke_steps() -> PhotoType:
+            current = receive
+            for transable in self.chains:
+                current = await transable.invoke(
+                    input,
+                    current,
+                    config=config,
+                    **kwargs,
+                )
+            return cast("PhotoType", current)
+
+        return await arun_with_tracing(
+            self,
+            _invoke_steps,
+            input,
+            receive,
+            config,
+            "invoke",
+        )
 
     @override
     async def stream(
@@ -553,7 +601,14 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         )
         for transable in self.chains[1:]:
             upstream = self._pipe(transable, upstream, input, config)
-        async for result in upstream:
+        async for result in aiter_with_tracing(
+            self,
+            upstream,
+            input,
+            receives,
+            config,
+            "stream",
+        ):
             yield cast("PhotoType", result)
 
     def _validate_chain(self) -> None:
@@ -693,32 +748,41 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> PhotoType:
         config = ensure_config(config)
-        if receive is None:
-            raise ValueError(
-                "Parallel Transables require an input PhotoResult when invoked."
-            )
-        upstream = coerce_photo(receive, self.PhotoType)
-        results: list[PhotoType | None] = [None] * len(self.steps)
 
-        async def _run(idx: int, step: Transable[Input, PhotoType]) -> None:
-            res = await arun_in_context(
-                config,
-                step.invoke,
-                input,
-                clone_photo(upstream),
-                config,
-                **kwargs,
-            )
-            results[idx] = coerce_photo(res, self.PhotoType)
+        async def _invoke_parallel() -> PhotoType:
+            if receive is None:
+                raise ValueError(
+                    "Parallel Transables require an input PhotoResult when invoked."
+                )
+            upstream = coerce_photo(receive, self.PhotoType)
+            results: list[PhotoType | None] = [None] * len(self.steps)
 
-        async with anyio.create_task_group() as tg:
-            for idx, step in enumerate(self.steps):
-                tg.start_soon(_run, idx, step)
+            async def _run(idx: int, step: Transable[Input, PhotoType]) -> None:
+                res = await step.invoke(
+                    input,
+                    clone_photo(upstream),
+                    config=config,
+                    **kwargs,
+                )
+                results[idx] = coerce_photo(res, self.PhotoType)
 
-        if any(res is None for res in results):
-            raise RuntimeError("Parallel step did not return a PhotoResult.")
+            async with anyio.create_task_group() as tg:
+                for idx, step in enumerate(self.steps):
+                    tg.start_soon(_run, idx, step)
 
-        return merge_photos(receive, [res for res in results if res is not None])
+            if any(res is None for res in results):
+                raise RuntimeError("Parallel step did not return a PhotoResult.")
+
+            return merge_photos(receive, [res for res in results if res is not None])
+
+        return await arun_with_tracing(
+            self,
+            _invoke_parallel,
+            input,
+            receive,
+            config,
+            "invoke",
+        )
 
     @override
     async def stream(
@@ -734,99 +798,112 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                 "Parallel Transables require an input PhotoResult stream when streamed."
             )
 
-        buffer_size = stream_buffer(config)
-        step_outputs: dict[str, list[PhotoType | None]] = defaultdict(
-            lambda: [None] * len(self.steps)
-        )
+        async def _stream_outputs() -> AsyncIterator[PhotoType]:
+            buffer_size = stream_buffer(config)
+            step_outputs: dict[str, list[PhotoType | None]] = defaultdict(
+                lambda: [None] * len(self.steps)
+            )
 
-        # Use an unbounded base stream to avoid backpressure deadlocks when downstream
-        # steps need to buffer multiple items before yielding.
-        base_send, base_recv = anyio.create_memory_object_stream[PhotoType](0)
-        child_sends: list[ObjectSendStream[PhotoType]] = []
-        child_recvs: list[ObjectReceiveStream[PhotoType]] = []
-        for _ in self.steps:
-            s, r = anyio.create_memory_object_stream(buffer_size)
-            child_sends.append(s)
-            child_recvs.append(r)
+            # Use an unbounded base stream to avoid backpressure deadlocks when downstream
+            # steps need to buffer multiple items before yielding.
+            base_send, base_recv = anyio.create_memory_object_stream[PhotoType](0)
+            child_sends: list[ObjectSendStream[PhotoType]] = []
+            child_recvs: list[ObjectReceiveStream[PhotoType]] = []
+            for _ in self.steps:
+                s, r = anyio.create_memory_object_stream(buffer_size)
+                child_sends.append(s)
+                child_recvs.append(r)
 
-        outpot_cond: anyio.Condition = anyio.Condition()
-        step_done: list[bool] = [False] * len(self.steps)
+            outpot_cond: anyio.Condition = anyio.Condition()
+            step_done: list[bool] = [False] * len(self.steps)
 
-        async def _broadcast() -> None:
-            try:
-                async for item in receives:
-                    coerced = coerce_photo(item, self.PhotoType)
-                    await base_send.send(clone_photo(coerced))
+            async def _broadcast() -> None:
+                try:
+                    async for item in receives:
+                        coerced = coerce_photo(item, self.PhotoType)
+                        await base_send.send(clone_photo(coerced))
+                        for send in child_sends:
+                            await send.send(clone_photo(coerced))
+                finally:
+                    await base_send.aclose()
                     for send in child_sends:
-                        await send.send(clone_photo(coerced))
-            finally:
-                await base_send.aclose()
-                for send in child_sends:
-                    await send.aclose()
+                        await send.aclose()
 
-        async def _run_step(idx: int, step: Transable[Input, PhotoType]) -> None:
-            try:
-                async with child_recvs[idx]:
-                    stream_iter = run_in_context(
-                        config,
-                        step.stream,
-                        input,
-                        child_recvs[idx],
-                        config,
-                    )
-                    async for result in stream_iter:
-                        coerced = coerce_photo(result, self.PhotoType)
-                        async with outpot_cond:
-                            step_outputs[coerced.get_unique_id()][idx] = clone_photo(
-                                coerced
-                            )
-                            outpot_cond.notify_all()
-            finally:
-                async with outpot_cond:
-                    step_done[idx] = True
-                    outpot_cond.notify_all()
-
-        async def _collect_outputs() -> AsyncIterator[PhotoType]:
-            async with base_recv:
-                async for base_item in base_recv:
-                    unique_id = base_item.get_unique_id()
-                    while True:
-                        async with outpot_cond:
-                            outputs = step_outputs[unique_id]
-                            missing = [
-                                idx for idx, res in enumerate(outputs) if res is None
-                            ]
-                            if not missing:
-                                merged = merge_photos(
-                                    base_item,
-                                    cast(
-                                        "list[PhotoType]",
-                                        outputs,
-                                    ),
+            async def _run_step(idx: int, step: Transable[Input, PhotoType]) -> None:
+                try:
+                    async with child_recvs[idx]:
+                        stream_iter = run_in_context(
+                            config,
+                            step.stream,
+                            input,
+                            child_recvs[idx],
+                            config,
+                        )
+                        async for result in stream_iter:
+                            coerced = coerce_photo(result, self.PhotoType)
+                            async with outpot_cond:
+                                step_outputs[coerced.get_unique_id()][idx] = (
+                                    clone_photo(coerced)
                                 )
-                                step_outputs.pop(unique_id, None)
-                                yield merged
-                                break
-                            if any(step_done[idx] for idx in missing):
-                                step_outputs.pop(unique_id, None)
-                                raise ValueError(
-                                    "Parallel step results missing for unique ID "
-                                    f"{unique_id}."
-                                )
-                            await outpot_cond.wait()
-                # Base stream exhausted; if steps emitted unmatched IDs, surface them.
-                if step_outputs:
-                    raise ValueError(
-                        "Parallel step produced results with no matching base item: "
-                        f"{', '.join(step_outputs.keys())}"
-                    )
+                                outpot_cond.notify_all()
+                finally:
+                    async with outpot_cond:
+                        step_done[idx] = True
+                        outpot_cond.notify_all()
 
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(_broadcast)
-            for idx, step in enumerate(self.steps):
-                tg.start_soon(_run_step, idx, step)
-            async for output in _collect_outputs():
-                yield output
+            async def _collect_outputs() -> AsyncIterator[PhotoType]:
+                async with base_recv:
+                    async for base_item in base_recv:
+                        unique_id = base_item.get_unique_id()
+                        while True:
+                            async with outpot_cond:
+                                outputs = step_outputs[unique_id]
+                                missing = [
+                                    idx
+                                    for idx, res in enumerate(outputs)
+                                    if res is None
+                                ]
+                                if not missing:
+                                    merged = merge_photos(
+                                        base_item,
+                                        cast(
+                                            "list[PhotoType]",
+                                            outputs,
+                                        ),
+                                    )
+                                    step_outputs.pop(unique_id, None)
+                                    yield merged
+                                    break
+                                if any(step_done[idx] for idx in missing):
+                                    step_outputs.pop(unique_id, None)
+                                    raise ValueError(
+                                        "Parallel step results missing for unique ID "
+                                        f"{unique_id}."
+                                    )
+                                await outpot_cond.wait()
+                    # Base stream exhausted; if steps emitted unmatched IDs, surface them.
+                    if step_outputs:
+                        raise ValueError(
+                            "Parallel step produced results with no matching base item: "
+                            f"{', '.join(step_outputs.keys())}"
+                        )
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_broadcast)
+                for idx, step in enumerate(self.steps):
+                    tg.start_soon(_run_step, idx, step)
+                async for output in _collect_outputs():
+                    yield output
+
+        async for output in aiter_with_tracing(
+            self,
+            _stream_outputs(),
+            input,
+            receives,
+            config,
+            "stream",
+        ):
+            yield output
 
 
 FuncType = (
@@ -1004,9 +1081,13 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
     ) -> PhotoType:
         config = ensure_config(config)
         if hasattr(self, "func"):
-            return await arun_in_context(
-                config,
+            return await arun_with_tracing(
+                self,
                 self._invoke,
+                input,
+                receive,
+                config,
+                "invoke",
                 input,
                 receive,
                 config,
@@ -1026,23 +1107,35 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         **kwargs: Any,
     ) -> AsyncIterator[PhotoType]:
         config = ensure_config(config)
-        if hasattr(self, "stream_func"):
-            stream_iter = run_in_context(
-                config,
-                self._stream,
-                input,
-                receives,
-                config,
-                **kwargs,
-            )
-            async for res in stream_iter:
-                yield res
-            return
-        if receives is None:
-            yield await self.invoke(input, None, config, **kwargs)
-            return
-        async for item in receives:
-            yield await self.invoke(input, item, config, **kwargs)
+
+        async def _stream_impl() -> AsyncIterator[PhotoType]:
+            if hasattr(self, "stream_func"):
+                stream_iter = run_in_context(
+                    config,
+                    self._stream,
+                    input,
+                    receives,
+                    config,
+                    **kwargs,
+                )
+                async for res in stream_iter:
+                    yield res
+                return
+            if receives is None:
+                yield await self.invoke(input, None, config, **kwargs)
+                return
+            async for item in receives:
+                yield await self.invoke(input, item, config, **kwargs)
+
+        async for res in aiter_with_tracing(
+            self,
+            _stream_impl(),
+            input,
+            receives,
+            config,
+            "stream",
+        ):
+            yield res
 
     async def _invoke(
         self,
@@ -1255,9 +1348,13 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> PhotoType:
         merged_config = self._merge_configs(config)
-        return await arun_in_context(
-            merged_config,
+        return await arun_with_tracing(
+            self,
             self.bound.invoke,
+            input,
+            receive,
+            merged_config,
+            "invoke",
             input,
             receive,
             merged_config,
@@ -1281,7 +1378,14 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
             merged_config,
             **{**self.kwargs, **kwargs},
         )
-        async for item in stream_iter:
+        async for item in aiter_with_tracing(
+            self,
+            stream_iter,
+            input,
+            receives,
+            merged_config,
+            "stream",
+        ):
             yield item
 
     @override
@@ -1293,9 +1397,13 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> list[PhotoType]:
         merged_config = self._merge_configs(config)
-        return await arun_in_context(
-            merged_config,
+        return await arun_with_tracing(
+            self,
             self.bound.batch,
+            input,
+            receives,
+            merged_config,
+            "batch",
             input,
             receives,
             merged_config,

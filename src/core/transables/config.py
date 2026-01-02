@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable, Generator, Sequence
 from contextlib import contextmanager
 from contextvars import Context, ContextVar, copy_context
 from typing import (
+    TYPE_CHECKING,
     Any,
     ParamSpec,
     TypedDict,
@@ -12,6 +13,11 @@ from typing import (
 )
 
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from uuid import UUID
+
+    from core.transables.tracing import TransableCallback
 
 P = ParamSpec("P")
 Output = TypeVar("Output")
@@ -26,6 +32,9 @@ class TransableConfig(TypedDict, total=False):
     max_concurrency: int | None
     stream_buffer: int
     recursion_limit: int
+    callbacks: list[TransableCallback] | None
+    trace: bool
+    run_id: UUID | None
 
 
 CONFIG_KEYS = [
@@ -35,11 +44,15 @@ CONFIG_KEYS = [
     "max_concurrency",
     "stream_buffer",
     "recursion_limit",
+    "callbacks",
+    "trace",
+    "run_id",
 ]
 
 COPIABLE_KEYS = [
     "tags",
     "metadata",
+    "callbacks",
 ]
 
 DEFAULT_RECURSION_LIMIT = 25
@@ -49,6 +62,11 @@ var_child_transable_config: ContextVar[TransableConfig | None] = ContextVar(
     "child_transable_config",
     default=None,
 )
+
+
+def get_current_config() -> TransableConfig | None:
+    """Return the current config from the context if set."""
+    return var_child_transable_config.get()
 
 
 class TransableConfigModel(BaseModel):
@@ -62,6 +80,9 @@ class TransableConfigModel(BaseModel):
     max_concurrency: int | None = None
     stream_buffer: int = DEFAULT_STREAM_BUFFER
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
+    callbacks: list[Any] = Field(default_factory=list)
+    trace: bool = False
+    run_id: UUID | None = None
 
 
 def _copy_config_values(config: TransableConfig) -> TransableConfig:
@@ -73,6 +94,8 @@ def _copy_config_values(config: TransableConfig) -> TransableConfig:
             copied[key] = list(cast("list[str]", value))
         elif key == "metadata":
             copied[key] = dict(cast("dict[str, Any]", value))
+        elif key == "callbacks":
+            copied[key] = list(cast("list[Any]", value))
         else:
             copied[key] = value
     return copied
@@ -96,6 +119,9 @@ def ensure_config(config: TransableConfig | None = None) -> TransableConfig:
         "metadata": {},
         "recursion_limit": DEFAULT_RECURSION_LIMIT,
         "stream_buffer": DEFAULT_STREAM_BUFFER,
+        "callbacks": [],
+        "trace": False,
+        "run_id": None,
     }
     if var_config := var_child_transable_config.get():
         empty.update(_copy_config_values(var_config))
@@ -130,6 +156,9 @@ def patch_config(
     max_concurrency: int | None = None,
     stream_buffer: int | None = None,
     recursion_limit: int | None = None,
+    callbacks: list[TransableCallback] | None = None,
+    trace: bool | None = None,
+    run_id: UUID | None = None,
 ) -> TransableConfig:
     """Patch a config with new values."""
     config = ensure_config(config)
@@ -141,6 +170,12 @@ def patch_config(
         config["stream_buffer"] = stream_buffer
     if recursion_limit is not None:
         config["recursion_limit"] = recursion_limit
+    if callbacks is not None:
+        config["callbacks"] = callbacks
+    if trace is not None:
+        config["trace"] = trace
+    if run_id is not None:
+        config["run_id"] = run_id
     return config
 
 
@@ -164,6 +199,14 @@ def merge_configs(*configs: TransableConfig | None) -> TransableConfig:
             elif key == "stream_buffer":
                 if value != DEFAULT_STREAM_BUFFER:
                     base["stream_buffer"] = int(cast("int", value))
+            elif key == "callbacks":
+                existing = list(cast("list[Any]", base.get("callbacks", []) or []))
+                base["callbacks"] = existing + list(cast("list[Any]", value) or [])
+            elif key == "trace":
+                base["trace"] = bool(value) or bool(base.get("trace", False))
+            elif key == "run_id":
+                if value is not None:
+                    base["run_id"] = cast("UUID", value)
             else:
                 base[key] = value
     return base
