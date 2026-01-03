@@ -386,7 +386,17 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
         upstream = _prepend(first, _coerce_stream(receives))
 
         buffer_size = stream_buffer(config)
-        target_branches = [branch for _, branch in self.branches] + [self.default]
+        target_branches: list[Transable[Input, PhotoType]] = []
+        seen_branch_ids: set[int] = set()
+        for _, branch in self.branches:
+            branch_id = id(branch)
+            if branch_id in seen_branch_ids:
+                continue
+            seen_branch_ids.add(branch_id)
+            target_branches.append(branch)
+        default_id = id(self.default)
+        if default_id not in seen_branch_ids:
+            target_branches.append(self.default)
         branch_map = {id(branch): idx for idx, branch in enumerate(target_branches)}
         branch_sends: list[ObjectSendStream[PhotoType]] = []
         branch_recvs: list[ObjectReceiveStream[PhotoType]] = []

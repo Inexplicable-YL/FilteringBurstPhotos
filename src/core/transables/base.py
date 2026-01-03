@@ -663,6 +663,7 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         input: Input,
         receives: AsyncIterator[PhotoType] | None,
         config: TransableConfig,
+        **kwargs: Any,
     ) -> AsyncIterator[Any]:
         upstream: AsyncIterator[Any] = run_in_context(
             config,
@@ -670,9 +671,10 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
             input,
             receives,
             config,
+            **kwargs,
         )
         for transable in self.chains[1:]:
-            upstream = self._pipe(transable, upstream, input, config)
+            upstream = self._pipe(transable, upstream, input, config, **kwargs)
         async for result in upstream:
             yield result
 
@@ -710,6 +712,7 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         upstream: AsyncIterator[Any],
         input: Input,
         config: TransableConfig | None = None,
+        **kwargs: Any,
     ) -> AsyncIterator[Any]:
         ensured_config = ensure_config(config)
         buffer_size = stream_buffer(ensured_config)
@@ -734,6 +737,7 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
                     input,
                     recv,
                     ensured_config,
+                    **kwargs,
                 )
                 async for result in stream_iter:
                     yield result
@@ -925,6 +929,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                         input,
                         child_recvs[idx],
                         config,
+                        **kwargs,
                     )
                     async for result in stream_iter:
                         coerced = coerce_photo(result, self.PhotoType)
@@ -1323,6 +1328,7 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
                 **kwargs,
             ):
                 yield item
+            return
         if receives is None:
             yield await self.invoke(input, None, config, **kwargs)
             return
