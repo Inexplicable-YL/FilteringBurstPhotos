@@ -14,9 +14,16 @@ from core.transables.config import (
     ensure_config,
     set_config_context,
 )
+from core.transables.utils import (
+    Input,
+    Output,
+    PhotoType,
+    acall_func_with_variable_args,
+    call_func_with_variable_args,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
 
 def _now() -> datetime:
@@ -167,25 +174,42 @@ def _create_run(
 
 async def arun_with_tracing(
     transable: object,
-    func: Callable[..., Any],
+    func: Callable[[Input], Awaitable[Output]]
+    | Callable[[Input, TransableConfig], Awaitable[Output]]
+    | Callable[[Input, PhotoType, TransableConfig], Awaitable[Output]]
+    | Callable[[Input, AsyncIterator[PhotoType]], Awaitable[Output]]
+    | Callable[[Input, AsyncIterator[PhotoType], TransableConfig], Awaitable[Output]],
     input_value: Any,
     receive_value: Any | None,
     config: TransableConfig,
     run_type: str,
-    *args: Any,
     **kwargs: Any,
-) -> Any:
+) -> Output:
     config = ensure_config(config)
     if not _should_trace(config):
         with set_config_context(config) as context:
-            return await context.run(func, *args, **kwargs)
+            return await context.run(
+                acall_func_with_variable_args,
+                func,
+                input_value,
+                receive_value,
+                config,
+                **kwargs,
+            )
 
     callbacks = _get_callbacks(config)
     run = _create_run(transable, config, input_value, receive_value, run_type)
     _notify(callbacks, "on_start", run, config)
     try:
         with set_run_context(run), set_config_context(config) as context:
-            result = await context.run(func, *args, **kwargs)
+            result = await context.run(
+                acall_func_with_variable_args,
+                func,
+                input_value,
+                receive_value,
+                config,
+                **kwargs,
+            )
     except BaseException as exc:
         run.error = exc
         run.end_time = _now()
@@ -199,15 +223,30 @@ async def arun_with_tracing(
 
 async def aiter_with_tracing(
     transable: object,
-    iterator: AsyncIterator[Any],
+    func: Callable[[Input], AsyncIterator[Output]]
+    | Callable[[Input, TransableConfig], AsyncIterator[Output]]
+    | Callable[[Input, PhotoType, TransableConfig], AsyncIterator[Output]]
+    | Callable[[Input, AsyncIterator[PhotoType]], AsyncIterator[Output]]
+    | Callable[
+        [Input, AsyncIterator[PhotoType], TransableConfig], AsyncIterator[Output]
+    ],
     input_value: Any,
     receive_value: Any | None,
     config: TransableConfig,
     run_type: str,
-) -> AsyncIterator[Any]:
+    **kwargs: Any,
+) -> AsyncIterator[Output]:
     config = ensure_config(config)
     if not _should_trace(config):
-        with set_config_context(config):
+        with set_config_context(config) as context:
+            iterator = context.run(
+                call_func_with_variable_args,
+                func,
+                input_value,
+                receive_value,
+                config,
+                **kwargs,
+            )
             async for item in iterator:
                 yield item
         return
@@ -217,7 +256,15 @@ async def aiter_with_tracing(
     _notify(callbacks, "on_start", run, config)
     _notify_stream(callbacks, "on_stream_start", run, None, config)
     try:
-        with set_run_context(run), set_config_context(config):
+        with set_run_context(run), set_config_context(config) as context:
+            iterator = context.run(
+                call_func_with_variable_args,
+                func,
+                input_value,
+                receive_value,
+                config,
+                **kwargs,
+            )
             async for item in iterator:
                 run.stream_count += 1
                 run.last_output = item

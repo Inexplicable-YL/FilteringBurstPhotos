@@ -259,6 +259,31 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
                     return transable
         return self.default
 
+    async def _invoke(
+        self,
+        input: Input,
+        receive: PhotoType | None,
+        config: TransableConfig,
+        **kwargs: Any,
+    ) -> PhotoType:
+        cache: dict[int, bool] = {}
+        receive_value = (
+            coerce_photo(receive, self.PhotoType) if receive is not None else None
+        )
+        branch = await self._select_branch(
+            input,
+            receive_value,
+            config,
+            cache,
+        )
+        result = await branch.invoke(
+            input,
+            receive_value,
+            config=config,
+            **kwargs,
+        )
+        return coerce_photo(result, self.PhotoType)
+
     @override
     async def invoke(
         self,
@@ -269,32 +294,198 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
     ) -> PhotoType:
         config = ensure_config(config)
 
-        async def _invoke_branch() -> PhotoType:
-            cache: dict[int, bool] = {}
-            receive_value = (
-                coerce_photo(receive, self.PhotoType) if receive is not None else None
-            )
-            branch = await self._select_branch(
-                input,
-                receive_value,
-                config,
-                cache,
-            )
-            result = await branch.invoke(
-                input,
-                receive_value,
-                config=config,
-                **kwargs,
-            )
-            return coerce_photo(result, self.PhotoType)
-
         return await self._call_with_config(
-            _invoke_branch,
+            self._invoke,
             input,
             receive,
             config,
             "invoke",
+            **kwargs,
         )
+
+    async def _stream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None,
+        config: TransableConfig,
+        **kwargs: Any,
+    ) -> AsyncIterator[PhotoType]:
+        cache: dict[int, bool] = {}
+
+        async def _select(photo: PhotoType | None) -> Transable[Input, PhotoType]:
+            return await self._select_branch(
+                input,
+                photo,
+                config,
+                cache,
+            )
+
+        if receives is None:
+            branch = await _select(None)
+            stream_iter = run_in_context(
+                config,
+                branch.stream,
+                input,
+                None,
+                config,
+                **kwargs,
+            )
+            async for result in stream_iter:
+                yield coerce_photo(result, self.PhotoType)
+            return
+
+        if not self._has_photo_conditions:
+            branch = await _select(None)
+            stream_iter = run_in_context(
+                config,
+                branch.stream,
+                input,
+                receives,
+                config,
+                **kwargs,
+            )
+            async for result in stream_iter:
+                yield coerce_photo(result, self.PhotoType)
+            return
+
+        async def _empty_stream() -> AsyncIterator[PhotoType]:
+            if False:
+                yield None
+
+        async def _prepend(
+            item: PhotoType, iterator: AsyncIterator[PhotoType]
+        ) -> AsyncIterator[PhotoType]:
+            yield item
+            async for value in iterator:
+                yield value
+
+        async def _coerce_stream(
+            iterator: AsyncIterator[PhotoType],
+        ) -> AsyncIterator[PhotoType]:
+            async for value in iterator:
+                yield coerce_photo(value, self.PhotoType)
+
+        try:
+            first_raw = await anext(receives)
+        except StopAsyncIteration:
+            # No photos upstream; still evaluate once for photo-based conditions.
+            branch = await _select(None)
+            stream_iter = run_in_context(
+                config,
+                branch.stream,
+                input,
+                _empty_stream(),
+                config,
+                **kwargs,
+            )
+            async for result in stream_iter:
+                yield coerce_photo(result, self.PhotoType)
+            return
+
+        first = coerce_photo(first_raw, self.PhotoType)
+        upstream = _prepend(first, _coerce_stream(receives))
+
+        buffer_size = stream_buffer(config)
+        target_branches = [branch for _, branch in self.branches] + [self.default]
+        branch_map = {id(branch): idx for idx, branch in enumerate(target_branches)}
+        branch_sends: list[ObjectSendStream[PhotoType]] = []
+        branch_recvs: list[ObjectReceiveStream[PhotoType]] = []
+        for _ in target_branches:
+            send, recv = anyio.create_memory_object_stream[PhotoType](buffer_size)
+            branch_sends.append(send)
+            branch_recvs.append(recv)
+
+        output_send, output_recv = anyio.create_memory_object_stream[
+            tuple[int, PhotoType]
+        ](buffer_size)
+        id_to_index: dict[str, int] = {}
+        seen_indices: set[int] = set()
+        total_inputs = 0
+        remaining_branches = len(target_branches)
+        remaining_lock = anyio.Lock()
+
+        async def _dispatch() -> None:
+            nonlocal total_inputs
+            try:
+                async for item in upstream:
+                    coerced = coerce_photo(item, self.PhotoType)
+                    unique_id = coerced.get_unique_id()
+                    if unique_id in id_to_index:
+                        raise ValueError(
+                            "Branch stream received duplicate photo unique ID "
+                            f"{unique_id}."
+                        )
+                    index = total_inputs
+                    total_inputs += 1
+                    id_to_index[unique_id] = index
+                    branch = await _select(coerced)
+                    branch_idx = branch_map.get(id(branch))
+                    if branch_idx is None:
+                        raise ValueError("Branch selection returned an unknown branch.")
+                    await branch_sends[branch_idx].send(coerced)
+            finally:
+                for send in branch_sends:
+                    await send.aclose()
+
+        async def _run_branch(idx: int, branch: Transable[Input, PhotoType]) -> None:
+            nonlocal remaining_branches
+            try:
+                async with branch_recvs[idx]:
+                    stream_iter = run_in_context(
+                        config,
+                        branch.stream,
+                        input,
+                        branch_recvs[idx],
+                        config,
+                        **kwargs,
+                    )
+                    async for result in stream_iter:
+                        coerced = coerce_photo(result, self.PhotoType)
+                        unique_id = coerced.get_unique_id()
+                        if unique_id not in id_to_index:
+                            raise ValueError(
+                                f"Branch output missing for unique ID {unique_id}."
+                            )
+                        index = id_to_index.pop(unique_id)
+                        if index in seen_indices:
+                            raise ValueError(
+                                f"Branch output duplicated for input index {index}."
+                            )
+                        seen_indices.add(index)
+                        await output_send.send((index, coerced))
+            finally:
+                async with remaining_lock:
+                    remaining_branches -= 1
+                    if remaining_branches == 0:
+                        await output_send.aclose()
+
+        async def _collect_outputs() -> AsyncIterator[PhotoType]:
+            next_index = 0
+            pending: dict[int, PhotoType] = {}
+            async with output_recv:
+                async for index, photo in output_recv:
+                    pending[index] = photo
+                    while next_index in pending:
+                        yield pending.pop(next_index)
+                        next_index += 1
+            if pending or id_to_index:
+                missing = sorted(id_to_index.values())
+                raise ValueError(
+                    "Branch outputs missing for input indexes: "
+                    f"{', '.join(str(idx) for idx in missing)}"
+                )
+            if next_index != total_inputs:
+                raise ValueError(
+                    "Branch outputs missing for input indexes: "
+                    f"{', '.join(str(idx) for idx in range(next_index, total_inputs))}"
+                )
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_dispatch)
+            for idx, branch in enumerate(target_branches):
+                tg.start_soon(_run_branch, idx, branch)
+            async for output in _collect_outputs():
+                yield coerce_photo(output, self.PhotoType)
 
     @override
     async def stream(
@@ -306,193 +497,12 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
     ) -> AsyncIterator[PhotoType]:
         config = ensure_config(config)
 
-        async def _stream_impl() -> AsyncIterator[PhotoType]:
-            cache: dict[int, bool] = {}
-
-            async def _select(photo: PhotoType | None) -> Transable[Input, PhotoType]:
-                return await self._select_branch(
-                    input,
-                    photo,
-                    config,
-                    cache,
-                )
-
-            if receives is None:
-                branch = await _select(None)
-                stream_iter = run_in_context(
-                    config,
-                    branch.stream,
-                    input,
-                    None,
-                    config,
-                    **kwargs,
-                )
-                async for result in stream_iter:
-                    yield coerce_photo(result, self.PhotoType)
-                return
-
-            if not self._has_photo_conditions:
-                branch = await _select(None)
-                stream_iter = run_in_context(
-                    config,
-                    branch.stream,
-                    input,
-                    receives,
-                    config,
-                    **kwargs,
-                )
-                async for result in stream_iter:
-                    yield coerce_photo(result, self.PhotoType)
-                return
-
-            async def _empty_stream() -> AsyncIterator[PhotoType]:
-                if False:
-                    yield None
-
-            async def _prepend(
-                item: PhotoType, iterator: AsyncIterator[PhotoType]
-            ) -> AsyncIterator[PhotoType]:
-                yield item
-                async for value in iterator:
-                    yield value
-
-            async def _coerce_stream(
-                iterator: AsyncIterator[PhotoType],
-            ) -> AsyncIterator[PhotoType]:
-                async for value in iterator:
-                    yield coerce_photo(value, self.PhotoType)
-
-            try:
-                first_raw = await anext(receives)
-            except StopAsyncIteration:
-                # No photos upstream; still evaluate once for photo-based conditions.
-                branch = await _select(None)
-                stream_iter = run_in_context(
-                    config,
-                    branch.stream,
-                    input,
-                    _empty_stream(),
-                    config,
-                    **kwargs,
-                )
-                async for result in stream_iter:
-                    yield coerce_photo(result, self.PhotoType)
-                return
-
-            first = coerce_photo(first_raw, self.PhotoType)
-            upstream = _prepend(first, _coerce_stream(receives))
-
-            buffer_size = stream_buffer(config)
-            target_branches = [branch for _, branch in self.branches] + [self.default]
-            branch_map = {id(branch): idx for idx, branch in enumerate(target_branches)}
-            branch_sends: list[ObjectSendStream[PhotoType]] = []
-            branch_recvs: list[ObjectReceiveStream[PhotoType]] = []
-            for _ in target_branches:
-                send, recv = anyio.create_memory_object_stream[PhotoType](buffer_size)
-                branch_sends.append(send)
-                branch_recvs.append(recv)
-
-            output_send, output_recv = anyio.create_memory_object_stream[
-                tuple[int, PhotoType]
-            ](buffer_size)
-            id_to_index: dict[str, int] = {}
-            seen_indices: set[int] = set()
-            total_inputs = 0
-            remaining_branches = len(target_branches)
-            remaining_lock = anyio.Lock()
-
-            async def _dispatch() -> None:
-                nonlocal total_inputs
-                try:
-                    async for item in upstream:
-                        coerced = coerce_photo(item, self.PhotoType)
-                        unique_id = coerced.get_unique_id()
-                        if unique_id in id_to_index:
-                            raise ValueError(
-                                "Branch stream received duplicate photo unique ID "
-                                f"{unique_id}."
-                            )
-                        index = total_inputs
-                        total_inputs += 1
-                        id_to_index[unique_id] = index
-                        branch = await _select(coerced)
-                        branch_idx = branch_map.get(id(branch))
-                        if branch_idx is None:
-                            raise ValueError(
-                                "Branch selection returned an unknown branch."
-                            )
-                        await branch_sends[branch_idx].send(coerced)
-                finally:
-                    for send in branch_sends:
-                        await send.aclose()
-
-            async def _run_branch(
-                idx: int, branch: Transable[Input, PhotoType]
-            ) -> None:
-                nonlocal remaining_branches
-                try:
-                    async with branch_recvs[idx]:
-                        stream_iter = run_in_context(
-                            config,
-                            branch.stream,
-                            input,
-                            branch_recvs[idx],
-                            config,
-                            **kwargs,
-                        )
-                        async for result in stream_iter:
-                            coerced = coerce_photo(result, self.PhotoType)
-                            unique_id = coerced.get_unique_id()
-                            if unique_id not in id_to_index:
-                                raise ValueError(
-                                    f"Branch output missing for unique ID {unique_id}."
-                                )
-                            index = id_to_index.pop(unique_id)
-                            if index in seen_indices:
-                                raise ValueError(
-                                    f"Branch output duplicated for input index {index}."
-                                )
-                            seen_indices.add(index)
-                            await output_send.send((index, coerced))
-                finally:
-                    async with remaining_lock:
-                        remaining_branches -= 1
-                        if remaining_branches == 0:
-                            await output_send.aclose()
-
-            async def _collect_outputs() -> AsyncIterator[PhotoType]:
-                next_index = 0
-                pending: dict[int, PhotoType] = {}
-                async with output_recv:
-                    async for index, photo in output_recv:
-                        pending[index] = photo
-                        while next_index in pending:
-                            yield pending.pop(next_index)
-                            next_index += 1
-                if pending or id_to_index:
-                    missing = sorted(id_to_index.values())
-                    raise ValueError(
-                        "Branch outputs missing for input indexes: "
-                        f"{', '.join(str(idx) for idx in missing)}"
-                    )
-                if next_index != total_inputs:
-                    raise ValueError(
-                        "Branch outputs missing for input indexes: "
-                        f"{', '.join(str(idx) for idx in range(next_index, total_inputs))}"
-                    )
-
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(_dispatch)
-                for idx, branch in enumerate(target_branches):
-                    tg.start_soon(_run_branch, idx, branch)
-                async for output in _collect_outputs():
-                    yield coerce_photo(output, self.PhotoType)
-
         async for result in self._stream_with_config(
-            _stream_impl(),
+            self._stream,
             input,
             receives,
             config,
             "stream",
+            **kwargs,
         ):
             yield result

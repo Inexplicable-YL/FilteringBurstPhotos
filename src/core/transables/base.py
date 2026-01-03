@@ -12,6 +12,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from functools import wraps
 from operator import itemgetter
 from types import GenericAlias
 from typing import (
@@ -43,6 +44,7 @@ from core.transables.serializable import (
 )
 from core.transables.tracing import (
     TransableListener,
+    TransableRun,
     aiter_with_tracing,
     arun_with_tracing,
 )
@@ -50,6 +52,7 @@ from core.transables.utils import (
     Input,
     OtherInput,
     OtherPhotoType,
+    Output,
     PhotoType,
     call_func_with_variable_args,
     clone_photo,
@@ -359,13 +362,14 @@ class Transable(ABC, Generic[Input, PhotoType]):
     def with_listeners(
         self,
         *,
-        on_start: Callable[[Any, TransableConfig], None] | None = None,
-        on_end: Callable[[Any, TransableConfig], None] | None = None,
-        on_error: Callable[[Any, TransableConfig], None] | None = None,
-        on_stream_start: Callable[[Any, TransableConfig], None] | None = None,
-        on_stream_chunk: Callable[[Any, Any, TransableConfig], None] | None = None,
-        on_stream_end: Callable[[Any, TransableConfig], None] | None = None,
-        on_stream_error: Callable[[Any, TransableConfig], None] | None = None,
+        on_start: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_end: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_error: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_stream_start: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_stream_chunk: Callable[[TransableRun, Any, TransableConfig], None]
+        | None = None,
+        on_stream_end: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_stream_error: Callable[[TransableRun, TransableConfig], None] | None = None,
     ) -> Transable[Input, PhotoType]:
         """Bind lifecycle listeners to a Transable."""
 
@@ -402,16 +406,33 @@ class Transable(ABC, Generic[Input, PhotoType]):
             kwargs={},
         )
 
+    def with_types(
+        self,
+        input_type: type[Input] | None = None,
+        photo_type: type[PhotoType] | None = None,
+    ) -> Transable[Input, PhotoType]:
+        return TransableBinding(
+            bound=self,
+            custom_input_type=input_type,
+            custom_photo_type=photo_type,
+            kwargs={},
+        )
+
     async def _call_with_config(
         self,
-        func: Callable[..., Awaitable[Any]],
+        func: Callable[[Input], Awaitable[Output]]
+        | Callable[[Input, TransableConfig], Awaitable[Output]]
+        | Callable[[Input, PhotoType, TransableConfig], Awaitable[Output]]
+        | Callable[[Input, AsyncIterator[PhotoType]], Awaitable[Output]]
+        | Callable[
+            [Input, AsyncIterator[PhotoType], TransableConfig], Awaitable[Output]
+        ],
         input: Input,
         receive_value: Any | None,
         config: TransableConfig | None,
         run_type: str,
-        *args: Any,
         **kwargs: Any,
-    ) -> Any:
+    ) -> Output:
         config = ensure_config(config)
         return await arun_with_tracing(
             self,
@@ -420,27 +441,35 @@ class Transable(ABC, Generic[Input, PhotoType]):
             receive_value,
             config,
             run_type,
-            *args,
             **kwargs,
         )
 
-    def _stream_with_config(
+    async def _stream_with_config(
         self,
-        iterator: AsyncIterator[Any],
+        func: Callable[[Input], AsyncIterator[Output]]
+        | Callable[[Input, TransableConfig], AsyncIterator[Output]]
+        | Callable[[Input, PhotoType, TransableConfig], AsyncIterator[Output]]
+        | Callable[[Input, AsyncIterator[PhotoType]], AsyncIterator[Output]]
+        | Callable[
+            [Input, AsyncIterator[PhotoType], TransableConfig], AsyncIterator[Output]
+        ],
         input: Input,
         receive_value: Any | None,
         config: TransableConfig | None,
         run_type: str,
-    ) -> AsyncIterator[Any]:
+        **kwargs: Any,
+    ) -> AsyncIterator[Output]:
         config = ensure_config(config)
-        return aiter_with_tracing(
+        async for item in aiter_with_tracing(
             self,
-            iterator,
+            func,
             input,
             receive_value,
             config,
             run_type,
-        )
+            **kwargs,
+        ):
+            yield item
 
 
 class TransableSerializable(Serializable, Transable[Input, PhotoType]):
@@ -593,6 +622,23 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
             for i, step in enumerate(self.chains)
         )
 
+    async def _invoke(
+        self,
+        input: Input,
+        receive: PhotoType | None,
+        config: TransableConfig,
+        **kwargs: Any,
+    ) -> PhotoType:
+        current = receive
+        for transable in self.chains:
+            current = await transable.invoke(
+                input,
+                current,
+                config=config,
+                **kwargs,
+            )
+        return cast("PhotoType", current)
+
     @override
     async def invoke(
         self,
@@ -603,24 +649,32 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
     ) -> PhotoType:
         config = ensure_config(config)
 
-        async def _invoke_steps() -> PhotoType:
-            current = receive
-            for transable in self.chains:
-                current = await transable.invoke(
-                    input,
-                    current,
-                    config=config,
-                    **kwargs,
-                )
-            return cast("PhotoType", current)
-
         return await self._call_with_config(
-            _invoke_steps,
+            self._invoke,
             input,
             receive,
             config,
             "invoke",
+            **kwargs,
         )
+
+    async def _stream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None,
+        config: TransableConfig,
+    ) -> AsyncIterator[Any]:
+        upstream: AsyncIterator[Any] = run_in_context(
+            config,
+            self.start.stream,
+            input,
+            receives,
+            config,
+        )
+        for transable in self.chains[1:]:
+            upstream = self._pipe(transable, upstream, input, config)
+        async for result in upstream:
+            yield result
 
     @override
     async def stream(
@@ -631,21 +685,14 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> AsyncIterator[PhotoType]:
         config = ensure_config(config)
-        upstream: AsyncIterator[Any] = run_in_context(
-            config,
-            self.start.stream,
-            input,
-            receives,
-            config,
-        )
-        for transable in self.chains[1:]:
-            upstream = self._pipe(transable, upstream, input, config)
+
         async for result in self._stream_with_config(
-            upstream,
+            self._stream,
             input,
             receives,
             config,
             "stream",
+            **kwargs,
         ):
             yield cast("PhotoType", result)
 
@@ -777,6 +824,38 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
             for i, step in enumerate(self.steps)
         )
 
+    async def _invoke(
+        self,
+        input: Input,
+        receive: PhotoType | None,
+        config: TransableConfig,
+        **kwargs: Any,
+    ) -> PhotoType:
+        if receive is None:
+            raise ValueError(
+                "Parallel Transables require an input PhotoResult when invoked."
+            )
+        upstream = coerce_photo(receive, self.PhotoType)
+        results: list[PhotoType | None] = [None] * len(self.steps)
+
+        async def _run(idx: int, step: Transable[Input, PhotoType]) -> None:
+            res = await step.invoke(
+                input,
+                clone_photo(upstream),
+                config=config,
+                **kwargs,
+            )
+            results[idx] = coerce_photo(res, self.PhotoType)
+
+        async with anyio.create_task_group() as tg:
+            for idx, step in enumerate(self.steps):
+                tg.start_soon(_run, idx, step)
+
+        if any(res is None for res in results):
+            raise RuntimeError("Parallel step did not return a PhotoResult.")
+
+        return merge_photos(receive, [res for res in results if res is not None])
+
     @override
     async def invoke(
         self,
@@ -787,39 +866,119 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
     ) -> PhotoType:
         config = ensure_config(config)
 
-        async def _invoke_parallel() -> PhotoType:
-            if receive is None:
-                raise ValueError(
-                    "Parallel Transables require an input PhotoResult when invoked."
-                )
-            upstream = coerce_photo(receive, self.PhotoType)
-            results: list[PhotoType | None] = [None] * len(self.steps)
-
-            async def _run(idx: int, step: Transable[Input, PhotoType]) -> None:
-                res = await step.invoke(
-                    input,
-                    clone_photo(upstream),
-                    config=config,
-                    **kwargs,
-                )
-                results[idx] = coerce_photo(res, self.PhotoType)
-
-            async with anyio.create_task_group() as tg:
-                for idx, step in enumerate(self.steps):
-                    tg.start_soon(_run, idx, step)
-
-            if any(res is None for res in results):
-                raise RuntimeError("Parallel step did not return a PhotoResult.")
-
-            return merge_photos(receive, [res for res in results if res is not None])
-
         return await self._call_with_config(
-            _invoke_parallel,
+            self._invoke,
             input,
             receive,
             config,
             "invoke",
+            **kwargs,
         )
+
+    async def _stream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None,
+        config: TransableConfig,
+        **kwargs: Any,
+    ) -> AsyncIterator[PhotoType]:
+        if receives is None:
+            raise ValueError(
+                "Parallel Transables require an input PhotoResult stream when streamed."
+            )
+        buffer_size = stream_buffer(config)
+        step_outputs: dict[str, list[PhotoType | None]] = defaultdict(
+            lambda: [None] * len(self.steps)
+        )
+
+        # Use an unbounded base stream to avoid backpressure deadlocks when downstream
+        # steps need to buffer multiple items before yielding.
+        base_send, base_recv = anyio.create_memory_object_stream[PhotoType](0)
+        child_sends: list[ObjectSendStream[PhotoType]] = []
+        child_recvs: list[ObjectReceiveStream[PhotoType]] = []
+        for _ in self.steps:
+            s, r = anyio.create_memory_object_stream(buffer_size)
+            child_sends.append(s)
+            child_recvs.append(r)
+
+        outpot_cond: anyio.Condition = anyio.Condition()
+        step_done: list[bool] = [False] * len(self.steps)
+
+        async def _broadcast() -> None:
+            try:
+                async for item in receives:
+                    coerced = coerce_photo(item, self.PhotoType)
+                    await base_send.send(clone_photo(coerced))
+                    for send in child_sends:
+                        await send.send(clone_photo(coerced))
+            finally:
+                await base_send.aclose()
+                for send in child_sends:
+                    await send.aclose()
+
+        async def _run_step(idx: int, step: Transable[Input, PhotoType]) -> None:
+            try:
+                async with child_recvs[idx]:
+                    stream_iter = run_in_context(
+                        config,
+                        step.stream,
+                        input,
+                        child_recvs[idx],
+                        config,
+                    )
+                    async for result in stream_iter:
+                        coerced = coerce_photo(result, self.PhotoType)
+                        async with outpot_cond:
+                            step_outputs[coerced.get_unique_id()][idx] = clone_photo(
+                                coerced
+                            )
+                            outpot_cond.notify_all()
+            finally:
+                async with outpot_cond:
+                    step_done[idx] = True
+                    outpot_cond.notify_all()
+
+        async def _collect_outputs() -> AsyncIterator[PhotoType]:
+            async with base_recv:
+                async for base_item in base_recv:
+                    unique_id = base_item.get_unique_id()
+                    while True:
+                        async with outpot_cond:
+                            outputs = step_outputs[unique_id]
+                            missing = [
+                                idx for idx, res in enumerate(outputs) if res is None
+                            ]
+                            if not missing:
+                                merged = merge_photos(
+                                    base_item,
+                                    cast(
+                                        "list[PhotoType]",
+                                        outputs,
+                                    ),
+                                )
+                                step_outputs.pop(unique_id, None)
+                                yield merged
+                                break
+                            if any(step_done[idx] for idx in missing):
+                                step_outputs.pop(unique_id, None)
+                                raise ValueError(
+                                    "Parallel step results missing for unique ID "
+                                    f"{unique_id}."
+                                )
+                            await outpot_cond.wait()
+                # Base stream exhausted; if steps emitted unmatched IDs, surface them.
+                if step_outputs:
+                    raise ValueError(
+                        "Parallel step produced results with no matching base item: "
+                        f"{', '.join(step_outputs.keys())}"
+                    )
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_broadcast)
+            for idx, step in enumerate(self.steps):
+                tg.start_soon(_run_step, idx, step)
+            async for output in _collect_outputs():
+                yield output
 
     @override
     async def stream(
@@ -830,114 +989,14 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> AsyncIterator[PhotoType]:
         config = ensure_config(config)
-        if receives is None:
-            raise ValueError(
-                "Parallel Transables require an input PhotoResult stream when streamed."
-            )
-
-        async def _stream_outputs() -> AsyncIterator[PhotoType]:
-            buffer_size = stream_buffer(config)
-            step_outputs: dict[str, list[PhotoType | None]] = defaultdict(
-                lambda: [None] * len(self.steps)
-            )
-
-            # Use an unbounded base stream to avoid backpressure deadlocks when downstream
-            # steps need to buffer multiple items before yielding.
-            base_send, base_recv = anyio.create_memory_object_stream[PhotoType](0)
-            child_sends: list[ObjectSendStream[PhotoType]] = []
-            child_recvs: list[ObjectReceiveStream[PhotoType]] = []
-            for _ in self.steps:
-                s, r = anyio.create_memory_object_stream(buffer_size)
-                child_sends.append(s)
-                child_recvs.append(r)
-
-            outpot_cond: anyio.Condition = anyio.Condition()
-            step_done: list[bool] = [False] * len(self.steps)
-
-            async def _broadcast() -> None:
-                try:
-                    async for item in receives:
-                        coerced = coerce_photo(item, self.PhotoType)
-                        await base_send.send(clone_photo(coerced))
-                        for send in child_sends:
-                            await send.send(clone_photo(coerced))
-                finally:
-                    await base_send.aclose()
-                    for send in child_sends:
-                        await send.aclose()
-
-            async def _run_step(idx: int, step: Transable[Input, PhotoType]) -> None:
-                try:
-                    async with child_recvs[idx]:
-                        stream_iter = run_in_context(
-                            config,
-                            step.stream,
-                            input,
-                            child_recvs[idx],
-                            config,
-                        )
-                        async for result in stream_iter:
-                            coerced = coerce_photo(result, self.PhotoType)
-                            async with outpot_cond:
-                                step_outputs[coerced.get_unique_id()][idx] = (
-                                    clone_photo(coerced)
-                                )
-                                outpot_cond.notify_all()
-                finally:
-                    async with outpot_cond:
-                        step_done[idx] = True
-                        outpot_cond.notify_all()
-
-            async def _collect_outputs() -> AsyncIterator[PhotoType]:
-                async with base_recv:
-                    async for base_item in base_recv:
-                        unique_id = base_item.get_unique_id()
-                        while True:
-                            async with outpot_cond:
-                                outputs = step_outputs[unique_id]
-                                missing = [
-                                    idx
-                                    for idx, res in enumerate(outputs)
-                                    if res is None
-                                ]
-                                if not missing:
-                                    merged = merge_photos(
-                                        base_item,
-                                        cast(
-                                            "list[PhotoType]",
-                                            outputs,
-                                        ),
-                                    )
-                                    step_outputs.pop(unique_id, None)
-                                    yield merged
-                                    break
-                                if any(step_done[idx] for idx in missing):
-                                    step_outputs.pop(unique_id, None)
-                                    raise ValueError(
-                                        "Parallel step results missing for unique ID "
-                                        f"{unique_id}."
-                                    )
-                                await outpot_cond.wait()
-                    # Base stream exhausted; if steps emitted unmatched IDs, surface them.
-                    if step_outputs:
-                        raise ValueError(
-                            "Parallel step produced results with no matching base item: "
-                            f"{', '.join(step_outputs.keys())}"
-                        )
-
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(_broadcast)
-                for idx, step in enumerate(self.steps):
-                    tg.start_soon(_run_step, idx, step)
-                async for output in _collect_outputs():
-                    yield output
 
         async for output in self._stream_with_config(
-            _stream_outputs(),
+            self._stream,
             input,
             receives,
             config,
             "stream",
+            **kwargs,
         ):
             yield output
 
@@ -1107,75 +1166,11 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
                 self._repr = "TransableLambda(...)"
         return self._repr
 
-    @override
-    async def invoke(
-        self,
-        input: Input,
-        receive: PhotoType | None = None,
-        config: TransableConfig | None = None,
-        **kwargs: Any,
-    ) -> PhotoType:
-        config = ensure_config(config)
-        if hasattr(self, "func"):
-            return await self._call_with_config(
-                self._invoke,
-                input,
-                receive,
-                config,
-                "invoke",
-                input,
-                receive,
-                config,
-                **kwargs,
-            )
-
-        raise TypeError(
-            "Cannot use invoke when only stream_func is defined.Please use stream instead."
-        )
-
-    @override
-    async def stream(
-        self,
-        input: Input,
-        receives: AsyncIterator[PhotoType] | None = None,
-        config: TransableConfig | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[PhotoType]:
-        config = ensure_config(config)
-
-        async def _stream_impl() -> AsyncIterator[PhotoType]:
-            if hasattr(self, "stream_func"):
-                stream_iter = run_in_context(
-                    config,
-                    self._stream,
-                    input,
-                    receives,
-                    config,
-                    **kwargs,
-                )
-                async for res in stream_iter:
-                    yield res
-                return
-            if receives is None:
-                yield await self.invoke(input, None, config, **kwargs)
-                return
-            async for item in receives:
-                yield await self.invoke(input, item, config, **kwargs)
-
-        async for res in self._stream_with_config(
-            _stream_impl(),
-            input,
-            receives,
-            config,
-            "stream",
-        ):
-            yield res
-
     async def _invoke(
         self,
         input: Input,
         receive: PhotoType | None,
-        config: TransableConfig | None,
+        config: TransableConfig,
         **kwargs: Any,
     ) -> Any:
         config = ensure_config(config)
@@ -1251,11 +1246,34 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
 
         return cast("PhotoType", output)
 
+    @override
+    async def invoke(
+        self,
+        input: Input,
+        receive: PhotoType | None = None,
+        config: TransableConfig | None = None,
+        **kwargs: Any,
+    ) -> PhotoType:
+        config = ensure_config(config)
+        if hasattr(self, "func"):
+            return await self._call_with_config(
+                self._invoke,
+                input,
+                receive,
+                config,
+                "invoke",
+                **kwargs,
+            )
+
+        raise TypeError(
+            "Cannot use invoke when only stream_func is defined.Please use stream instead."
+        )
+
     async def _stream(
         self,
         input: Input,
         receives: AsyncIterator[PhotoType] | None,
-        config: TransableConfig | None,
+        config: TransableConfig,
         **kwargs: Any,
     ) -> AsyncIterator[PhotoType]:
         if is_generator(self.stream_func):
@@ -1284,6 +1302,32 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
                 yield coerce_photo(res, self.PhotoType)
         else:
             raise TypeError("stream_func must be a generator or async generator.")
+
+    @override
+    async def stream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[PhotoType]:
+        config = ensure_config(config)
+
+        if hasattr(self, "stream_func"):
+            async for item in self._stream_with_config(
+                self._stream,
+                input,
+                receives,
+                config,
+                "stream",
+                **kwargs,
+            ):
+                yield item
+        if receives is None:
+            yield await self.invoke(input, None, config, **kwargs)
+            return
+        async for item in receives:
+            yield await self.invoke(input, item, config, **kwargs)
 
     @override
     def __eq__(self, other: object) -> bool:
@@ -1388,9 +1432,6 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
             receive,
             merged_config,
             "invoke",
-            input,
-            receive,
-            merged_config,
             **{**self.kwargs, **kwargs},
         )
 
@@ -1403,20 +1444,14 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> AsyncIterator[PhotoType]:
         merged_config = self._merge_configs(config)
-        stream_iter = run_in_context(
-            merged_config,
+
+        async for item in self._stream_with_config(
             self.bound.stream,
             input,
             receives,
             merged_config,
-            **{**self.kwargs, **kwargs},
-        )
-        async for item in self._stream_with_config(
-            stream_iter,
-            input,
-            receives,
-            merged_config,
             "stream",
+            **{**self.kwargs, **kwargs},
         ):
             yield item
 
@@ -1435,9 +1470,6 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
             receives,
             merged_config,
             "batch",
-            input,
-            receives,
-            merged_config,
             **{**self.kwargs, **kwargs},
         )
 
@@ -1454,6 +1486,25 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         )
 
     @override
+    def with_types(
+        self,
+        input_type: type[Input] | None = None,
+        photo_type: type[PhotoType] | None = None,
+    ) -> Transable[Input, PhotoType]:
+        return self.__class__(
+            bound=self.bound,
+            kwargs=self.kwargs,
+            config=self.config,
+            config_factories=self.config_factories,
+            custom_input_type=(
+                input_type if input_type is not None else self.custom_input_type
+            ),
+            custom_photo_type=(
+                photo_type if photo_type is not None else self.custom_photo_type
+            ),
+        )
+
+    @override
     def with_config(
         self,
         config: TransableConfig | None = None,
@@ -1467,6 +1518,83 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
             custom_input_type=self.custom_input_type,
             custom_photo_type=self.custom_photo_type,
         )
+
+    @override
+    def with_listeners(
+        self,
+        *,
+        on_start: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_end: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_error: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_stream_start: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_stream_chunk: Callable[[TransableRun, Any, TransableConfig], None]
+        | None = None,
+        on_stream_end: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_stream_error: Callable[[TransableRun, TransableConfig], None] | None = None,
+    ) -> Transable[Input, PhotoType]:
+        """Bind lifecycle listeners to a Transable."""
+
+        listener = TransableListener(
+            on_start=on_start,
+            on_end=on_end,
+            on_error=on_error,
+            on_stream_start=on_stream_start,
+            on_stream_chunk=on_stream_chunk,
+            on_stream_end=on_stream_end,
+            on_stream_error=on_stream_error,
+        )
+
+        def listener_factory(_config: TransableConfig) -> TransableConfig:
+            return {
+                "callbacks": [listener],
+                "trace": True,
+            }
+
+        return self.__class__(
+            bound=self.bound,
+            kwargs=self.kwargs,
+            config=self.config,
+            config_factories=[listener_factory, *self.config_factories],
+            custom_input_type=self.custom_input_type,
+            custom_photo_type=self.custom_photo_type,
+        )
+
+    @override
+    def __getattr__(self, name: str) -> Any:  # type: ignore[misc]
+        attr = getattr(self.bound, name)
+
+        if callable(attr) and (
+            config_param := inspect.signature(attr).parameters.get("config")
+        ):
+            if config_param.kind == inspect.Parameter.KEYWORD_ONLY:
+
+                @wraps(attr)
+                def wrapper(*args: Any, **kwargs: Any) -> Any:
+                    return attr(
+                        *args,
+                        config=merge_configs(self.config, kwargs.pop("config", None)),
+                        **kwargs,
+                    )
+
+                return wrapper
+            if config_param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD:
+                idx = list(inspect.signature(attr).parameters).index("config")
+
+                @wraps(attr)
+                def wrapper(*args: Any, **kwargs: Any) -> Any:
+                    if len(args) >= idx + 1:
+                        argsl = list(args)
+                        argsl[idx] = merge_configs(self.config, argsl[idx])
+                        return attr(*argsl, **kwargs)
+                    return attr(
+                        *args,
+                        config=merge_configs(self.config, kwargs.pop("config", None)),
+                        **kwargs,
+                    )
+
+                return wrapper
+
+        return attr
 
 
 class _TransableCallableSync(Protocol[Input, PhotoType]):
