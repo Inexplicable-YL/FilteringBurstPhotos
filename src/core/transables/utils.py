@@ -24,6 +24,7 @@ from core.transables.config import (
     DEFAULT_STREAM_BUFFER,
     arun_in_context,
     ensure_config,
+    patch_config,
     run_in_context,
 )
 
@@ -156,6 +157,12 @@ def accepts_receives(callable: Callable[..., Any]) -> bool:  # noqa: A002
         return False
 
 
+def _config_for_call(config: TransableConfig | None) -> TransableConfig:
+    if config is not None and (config.get("callbacks") or config.get("trace")):
+        return patch_config(config, child=True)
+    return ensure_config(config)
+
+
 def call_func_with_variable_args(
     func: Callable[[Input], Output]
     | Callable[[Input, TransableConfig], Output]
@@ -179,9 +186,9 @@ def call_func_with_variable_args(
     Returns:
         PhotoType: The result of the function call.
     """
-    config = ensure_config(config)
+    config_for_call = _config_for_call(config)
     if accepts_config(func):
-        kwargs["config"] = config
+        kwargs["config"] = config_for_call
     if accepts_receive(func) and not isinstance(all_receive, Iterator | AsyncIterator):
         kwargs["receive"] = all_receive
     elif accepts_receives(func) and (
@@ -197,7 +204,7 @@ def call_func_with_variable_args(
 
             all_receive = async_wrapper(all_receive)
         kwargs["receives"] = all_receive
-    return run_in_context(config, func, input, **kwargs)  # type: ignore[arg-type]
+    return run_in_context(config_for_call, func, input, **kwargs)  # type: ignore[arg-type]
 
 
 async def acall_func_with_variable_args(
@@ -223,9 +230,9 @@ async def acall_func_with_variable_args(
     Returns:
         PhotoType: The result of the function call.
     """
-    config = ensure_config(config)
+    config_for_call = _config_for_call(config)
     if accepts_config(func):
-        kwargs["config"] = config
+        kwargs["config"] = config_for_call
     if accepts_receive(func) and not isinstance(all_receive, Iterator | AsyncIterator):
         kwargs["receive"] = all_receive
     elif accepts_receives(func) and (
@@ -241,7 +248,9 @@ async def acall_func_with_variable_args(
 
             all_receive = async_wrapper(all_receive)
         kwargs["receives"] = all_receive
-    return await arun_in_context(config, func, input, **kwargs)  # type: ignore[arg-type]
+    return await arun_in_context(
+        config_for_call, func, input, **kwargs  # type: ignore[arg-type]
+    )
 
 
 def is_generator(func: Any) -> TypeGuard[Callable[..., Iterator]]:

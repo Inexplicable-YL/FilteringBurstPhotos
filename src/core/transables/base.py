@@ -304,22 +304,24 @@ class Transable(ABC, Generic[Input, PhotoType]):
         """Consume a stream of inputs and yield streaming results."""
         config = ensure_config(config)
         if receives is None:
+            child_config = patch_config(config, child=True)
             yield await arun_in_context(
-                config,
+                child_config,
                 self.invoke,
                 input,
                 None,
-                config,
+                child_config,
                 **kwargs,
             )
             return
         async for item in receives:
+            child_config = patch_config(config, child=True)
             yield await arun_in_context(
-                config,
+                child_config,
                 self.invoke,
                 input,
                 item,
-                config,
+                child_config,
                 **kwargs,
             )
 
@@ -631,10 +633,11 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
     ) -> PhotoType:
         current = receive
         for transable in self.chains:
+            child_config = patch_config(config, child=True)
             current = await transable.invoke(
                 input,
                 current,
-                config=config,
+                config=child_config,
                 **kwargs,
             )
         return cast("PhotoType", current)
@@ -665,12 +668,13 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         config: TransableConfig,
         **kwargs: Any,
     ) -> AsyncIterator[Any]:
+        child_config = patch_config(config, child=True)
         upstream: AsyncIterator[Any] = run_in_context(
-            config,
+            child_config,
             self.start.stream,
             input,
             receives,
-            config,
+            child_config,
             **kwargs,
         )
         for transable in self.chains[1:]:
@@ -716,6 +720,7 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
     ) -> AsyncIterator[Any]:
         ensured_config = ensure_config(config)
         buffer_size = stream_buffer(ensured_config)
+        child_config = patch_config(ensured_config, child=True)
 
         async def _gen() -> AsyncIterator[Any]:
             send, recv = anyio.create_memory_object_stream[Any](
@@ -732,11 +737,11 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
             async with anyio.create_task_group() as tg, recv:
                 tg.start_soon(_produce)
                 stream_iter = run_in_context(
-                    ensured_config,
+                    child_config,
                     downstream.stream,
                     input,
                     recv,
-                    ensured_config,
+                    child_config,
                     **kwargs,
                 )
                 async for result in stream_iter:
@@ -843,10 +848,11 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         results: list[PhotoType | None] = [None] * len(self.steps)
 
         async def _run(idx: int, step: Transable[Input, PhotoType]) -> None:
+            child_config = patch_config(config, child=True)
             res = await step.invoke(
                 input,
                 clone_photo(upstream),
-                config=config,
+                config=child_config,
                 **kwargs,
             )
             results[idx] = coerce_photo(res, self.PhotoType)
@@ -923,12 +929,13 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         async def _run_step(idx: int, step: Transable[Input, PhotoType]) -> None:
             try:
                 async with child_recvs[idx]:
+                    child_config = patch_config(config, child=True)
                     stream_iter = run_in_context(
-                        config,
+                        child_config,
                         step.stream,
                         input,
                         child_recvs[idx],
-                        config,
+                        child_config,
                         **kwargs,
                     )
                     async for result in stream_iter:
@@ -1242,10 +1249,11 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
                 raise RecursionError(
                     f"Recursion limit reached when invoking {self} with input {input}."
                 )
+            child_config = patch_config(config, child=True)
             output = await output.invoke(
                 input,
                 receive,
-                patch_config(config, recursion_limit=recursion_limit - 1),
+                patch_config(child_config, recursion_limit=recursion_limit - 1),
                 **kwargs,
             )
 
@@ -1432,12 +1440,10 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> PhotoType:
         merged_config = self._merge_configs(config)
-        return await self._call_with_config(
-            self.bound.invoke,
+        return await self.bound.invoke(
             input,
             receive,
             merged_config,
-            "invoke",
             **{**self.kwargs, **kwargs},
         )
 
@@ -1451,12 +1457,10 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
     ) -> AsyncIterator[PhotoType]:
         merged_config = self._merge_configs(config)
 
-        async for item in self._stream_with_config(
-            self.bound.stream,
+        async for item in self.bound.stream(
             input,
             receives,
             merged_config,
-            "stream",
             **{**self.kwargs, **kwargs},
         ):
             yield item
@@ -1470,12 +1474,10 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         **kwargs: Any,
     ) -> list[PhotoType]:
         merged_config = self._merge_configs(config)
-        return await self._call_with_config(
-            self.bound.batch,
+        return await self.bound.batch(
             input,
             receives,
             merged_config,
-            "batch",
             **{**self.kwargs, **kwargs},
         )
 

@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from core.transables.config import (
     TransableConfig,
+    TransableCallbackManager,
+    coro_with_context,
     ensure_config,
     set_config_context,
 )
@@ -100,6 +102,8 @@ def _resolve_name(transable: object, config: TransableConfig) -> str:
 
 def _get_callbacks(config: TransableConfig) -> list[TransableCallback]:
     callbacks = config.get("callbacks") or []
+    if isinstance(callbacks, TransableCallbackManager):
+        return callbacks.handlers
     return list(callbacks)
 
 
@@ -188,7 +192,7 @@ async def arun_with_tracing(
     config = ensure_config(config)
     if not _should_trace(config):
         with set_config_context(config) as context:
-            return await context.run(
+            coro = context.run(
                 acall_func_with_variable_args,
                 func,
                 input_value,
@@ -196,13 +200,14 @@ async def arun_with_tracing(
                 config,
                 **kwargs,
             )
+            return await coro_with_context(coro, context, create_task=True)
 
     callbacks = _get_callbacks(config)
     run = _create_run(transable, config, input_value, receive_value, run_type)
     _notify(callbacks, "on_start", run, config)
     try:
         with set_run_context(run), set_config_context(config) as context:
-            result = await context.run(
+            coro = context.run(
                 acall_func_with_variable_args,
                 func,
                 input_value,
@@ -210,6 +215,7 @@ async def arun_with_tracing(
                 config,
                 **kwargs,
             )
+            result = await coro_with_context(coro, context, create_task=True)
     except BaseException as exc:
         run.error = exc
         run.end_time = _now()
@@ -247,7 +253,11 @@ async def aiter_with_tracing(
                 config,
                 **kwargs,
             )
-            async for item in iterator:
+            while True:
+                try:
+                    item = await coro_with_context(anext(iterator), context)
+                except StopAsyncIteration:
+                    break
                 yield item
         return
 
@@ -265,7 +275,11 @@ async def aiter_with_tracing(
                 config,
                 **kwargs,
             )
-            async for item in iterator:
+            while True:
+                try:
+                    item = await coro_with_context(anext(iterator), context)
+                except StopAsyncIteration:
+                    break
                 run.stream_count += 1
                 run.last_output = item
                 _notify_stream(callbacks, "on_stream_chunk", run, item, config)

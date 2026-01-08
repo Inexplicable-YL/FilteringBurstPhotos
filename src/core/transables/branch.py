@@ -32,6 +32,7 @@ from core.transables.config import (
     TransableConfig,
     arun_in_context,
     ensure_config,
+    patch_config,
     run_in_context,
 )
 from core.transables.models import Photo
@@ -276,10 +277,11 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
             config,
             cache,
         )
+        child_config = patch_config(config, child=True)
         result = await branch.invoke(
             input,
             receive_value,
-            config=config,
+            config=child_config,
             **kwargs,
         )
         return coerce_photo(result, self.PhotoType)
@@ -322,12 +324,13 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
 
         if receives is None:
             branch = await _select(None)
+            child_config = patch_config(config, child=True)
             stream_iter = run_in_context(
-                config,
+                child_config,
                 branch.stream,
                 input,
                 None,
-                config,
+                child_config,
                 **kwargs,
             )
             async for result in stream_iter:
@@ -336,12 +339,13 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
 
         if not self._has_photo_conditions:
             branch = await _select(None)
+            child_config = patch_config(config, child=True)
             stream_iter = run_in_context(
-                config,
+                child_config,
                 branch.stream,
                 input,
                 receives,
-                config,
+                child_config,
                 **kwargs,
             )
             async for result in stream_iter:
@@ -370,12 +374,13 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
         except StopAsyncIteration:
             # No photos upstream; still evaluate once for photo-based conditions.
             branch = await _select(None)
+            child_config = patch_config(config, child=True)
             stream_iter = run_in_context(
-                config,
+                child_config,
                 branch.stream,
                 input,
                 _empty_stream(),
-                config,
+                child_config,
                 **kwargs,
             )
             async for result in stream_iter:
@@ -441,12 +446,13 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
             nonlocal remaining_branches
             try:
                 async with branch_recvs[idx]:
+                    child_config = patch_config(config, child=True)
                     stream_iter = run_in_context(
-                        config,
+                        child_config,
                         branch.stream,
                         input,
                         branch_recvs[idx],
-                        config,
+                        child_config,
                         **kwargs,
                     )
                     async for result in stream_iter:
