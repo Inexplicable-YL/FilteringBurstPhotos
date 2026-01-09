@@ -71,6 +71,30 @@ class TransableCallback(Protocol):
     def on_stream_error(self, run: TransableRun, config: TransableConfig) -> None: ...
 
 
+class AsyncTransableCallback(Protocol):
+    async def on_start(self, run: TransableRun, config: TransableConfig) -> None: ...
+
+    async def on_end(self, run: TransableRun, config: TransableConfig) -> None: ...
+
+    async def on_error(self, run: TransableRun, config: TransableConfig) -> None: ...
+
+    async def on_stream_start(
+        self, run: TransableRun, config: TransableConfig
+    ) -> None: ...
+
+    async def on_stream_chunk(
+        self, run: TransableRun, chunk: Any, config: TransableConfig
+    ) -> None: ...
+
+    async def on_stream_end(
+        self, run: TransableRun, config: TransableConfig
+    ) -> None: ...
+
+    async def on_stream_error(
+        self, run: TransableRun, config: TransableConfig
+    ) -> None: ...
+
+
 var_current_run: ContextVar[TransableRun | None] = ContextVar(
     "current_transable_run",
     default=None,
@@ -100,15 +124,29 @@ def _resolve_name(transable: object, config: TransableConfig) -> str:
     return type(transable).__name__
 
 
-def _get_callbacks(config: TransableConfig) -> list[TransableCallback]:
+def _get_callbacks(
+    config: TransableConfig,
+) -> list[TransableCallback | AsyncTransableCallback]:
     callbacks = config.get("callbacks") or []
     if isinstance(callbacks, TransableCallbackManager):
         return callbacks.handlers
     return list(callbacks)
 
 
-def _notify(
-    callbacks: list[TransableCallback],
+def _safe_call(func: Callable[..., Any], *args: Any) -> Any:
+    with contextlib.suppress(Exception):
+        return func(*args)
+    return None
+
+
+async def _maybe_await(result: Any) -> None:
+    if inspect.isawaitable(result):
+        with contextlib.suppress(Exception):
+            await result
+
+
+async def _notify(
+    callbacks: list[TransableCallback | AsyncTransableCallback],
     method: str,
     run: TransableRun,
     config: TransableConfig,
@@ -117,11 +155,12 @@ def _notify(
         handler = getattr(callback, method, None)
         if handler is None:
             continue
-        _call_handler(handler, run, config)
+        result = _call_handler(handler, run, config)
+        await _maybe_await(result)
 
 
-def _notify_stream(
-    callbacks: list[TransableCallback],
+async def _notify_stream(
+    callbacks: list[TransableCallback | AsyncTransableCallback],
     method: str,
     run: TransableRun,
     chunk: Any | None,
@@ -132,9 +171,11 @@ def _notify_stream(
         if handler is None:
             continue
         if chunk is None:
-            _call_handler(handler, run, config)
+            result = _call_handler(handler, run, config)
+            await _maybe_await(result)
         else:
-            _call_stream_handler(handler, run, chunk, config)
+            result = _call_stream_handler(handler, run, chunk, config)
+            await _maybe_await(result)
 
 
 def _should_trace(config: TransableConfig) -> bool:
@@ -204,7 +245,7 @@ async def arun_with_tracing(
 
     callbacks = _get_callbacks(config)
     run = _create_run(transable, config, input_value, receive_value, run_type)
-    _notify(callbacks, "on_start", run, config)
+    await _notify(callbacks, "on_start", run, config)
     try:
         with set_run_context(run), set_config_context(config) as context:
             coro = context.run(
@@ -219,11 +260,11 @@ async def arun_with_tracing(
     except BaseException as exc:
         run.error = exc
         run.end_time = _now()
-        _notify(callbacks, "on_error", run, config)
+        await _notify(callbacks, "on_error", run, config)
         raise
     run.output = result
     run.end_time = _now()
-    _notify(callbacks, "on_end", run, config)
+    await _notify(callbacks, "on_end", run, config)
     return result
 
 
@@ -263,8 +304,8 @@ async def aiter_with_tracing(
 
     callbacks = _get_callbacks(config)
     run = _create_run(transable, config, input_value, receive_value, run_type)
-    _notify(callbacks, "on_start", run, config)
-    _notify_stream(callbacks, "on_stream_start", run, None, config)
+    await _notify(callbacks, "on_start", run, config)
+    await _notify_stream(callbacks, "on_stream_start", run, None, config)
     try:
         with set_run_context(run), set_config_context(config) as context:
             iterator = context.run(
@@ -282,32 +323,56 @@ async def aiter_with_tracing(
                     break
                 run.stream_count += 1
                 run.last_output = item
-                _notify_stream(callbacks, "on_stream_chunk", run, item, config)
+                await _notify_stream(callbacks, "on_stream_chunk", run, item, config)
                 yield item
     except BaseException as exc:
         run.error = exc
         run.end_time = _now()
-        _notify_stream(callbacks, "on_stream_error", run, None, config)
-        _notify(callbacks, "on_error", run, config)
+        await _notify_stream(callbacks, "on_stream_error", run, None, config)
+        await _notify(callbacks, "on_error", run, config)
         raise
     run.output = run.last_output
     run.end_time = _now()
-    _notify_stream(callbacks, "on_stream_end", run, None, config)
-    _notify(callbacks, "on_end", run, config)
+    await _notify_stream(callbacks, "on_stream_end", run, None, config)
+    await _notify(callbacks, "on_end", run, config)
 
 
 class TransableListener:
     def __init__(
         self,
         *,
-        on_start: Callable[[TransableRun, TransableConfig], None] | None = None,
-        on_end: Callable[[TransableRun, TransableConfig], None] | None = None,
-        on_error: Callable[[TransableRun, TransableConfig], None] | None = None,
-        on_stream_start: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_start: (
+            Callable[[TransableRun], None]
+            | Callable[[TransableRun, TransableConfig], None]
+            | None
+        ) = None,
+        on_end: (
+            Callable[[TransableRun], None]
+            | Callable[[TransableRun, TransableConfig], None]
+            | None
+        ) = None,
+        on_error: (
+            Callable[[TransableRun], None]
+            | Callable[[TransableRun, TransableConfig], None]
+            | None
+        ) = None,
+        on_stream_start: (
+            Callable[[TransableRun], None]
+            | Callable[[TransableRun, TransableConfig], None]
+            | None
+        ) = None,
         on_stream_chunk: Callable[[TransableRun, Any, TransableConfig], None]
         | None = None,
-        on_stream_end: Callable[[TransableRun, TransableConfig], None] | None = None,
-        on_stream_error: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_stream_end: (
+            Callable[[TransableRun], None]
+            | Callable[[TransableRun, TransableConfig], None]
+            | None
+        ) = None,
+        on_stream_error: (
+            Callable[[TransableRun], None]
+            | Callable[[TransableRun, TransableConfig], None]
+            | None
+        ) = None,
     ) -> None:
         self._on_start = on_start
         self._on_end = on_end
@@ -358,21 +423,110 @@ class TransableListener:
         _call_handler(self._on_stream_error, run, config)
 
 
+class AsyncTransableListener:
+    def __init__(
+        self,
+        *,
+        on_start: (
+            Callable[[TransableRun], Awaitable[None]]
+            | Callable[[TransableRun, TransableConfig], Awaitable[None]]
+            | None
+        ) = None,
+        on_end: (
+            Callable[[TransableRun], Awaitable[None]]
+            | Callable[[TransableRun, TransableConfig], Awaitable[None]]
+            | None
+        ) = None,
+        on_error: (
+            Callable[[TransableRun], Awaitable[None]]
+            | Callable[[TransableRun, TransableConfig], Awaitable[None]]
+            | None
+        ) = None,
+        on_stream_start: (
+            Callable[[TransableRun], Awaitable[None]]
+            | Callable[[TransableRun, TransableConfig], Awaitable[None]]
+            | None
+        ) = None,
+        on_stream_chunk: Callable[[TransableRun, Any, TransableConfig], Awaitable[None]]
+        | None = None,
+        on_stream_end: (
+            Callable[[TransableRun], Awaitable[None]]
+            | Callable[[TransableRun, TransableConfig], Awaitable[None]]
+            | None
+        ) = None,
+        on_stream_error: (
+            Callable[[TransableRun], Awaitable[None]]
+            | Callable[[TransableRun, TransableConfig], Awaitable[None]]
+            | None
+        ) = None,
+    ) -> None:
+        self._on_start = on_start
+        self._on_end = on_end
+        self._on_error = on_error
+        self._on_stream_start = on_stream_start
+        self._on_stream_chunk = on_stream_chunk
+        self._on_stream_end = on_stream_end
+        self._on_stream_error = on_stream_error
+
+    async def on_start(self, run: TransableRun, config: TransableConfig) -> None:
+        if self._on_start is None:
+            return
+        result = _call_handler(self._on_start, run, config)
+        await _maybe_await(result)
+
+    async def on_end(self, run: TransableRun, config: TransableConfig) -> None:
+        if self._on_end is None:
+            return
+        result = _call_handler(self._on_end, run, config)
+        await _maybe_await(result)
+
+    async def on_error(self, run: TransableRun, config: TransableConfig) -> None:
+        if self._on_error is None:
+            return
+        result = _call_handler(self._on_error, run, config)
+        await _maybe_await(result)
+
+    async def on_stream_start(self, run: TransableRun, config: TransableConfig) -> None:
+        if self._on_stream_start is None:
+            return
+        result = _call_handler(self._on_stream_start, run, config)
+        await _maybe_await(result)
+
+    async def on_stream_chunk(
+        self,
+        run: TransableRun,
+        chunk: Any,
+        config: TransableConfig,
+    ) -> None:
+        if self._on_stream_chunk is None:
+            return
+        result = _call_stream_handler(self._on_stream_chunk, run, chunk, config)
+        await _maybe_await(result)
+
+    async def on_stream_end(self, run: TransableRun, config: TransableConfig) -> None:
+        if self._on_stream_end is None:
+            return
+        result = _call_handler(self._on_stream_end, run, config)
+        await _maybe_await(result)
+
+    async def on_stream_error(self, run: TransableRun, config: TransableConfig) -> None:
+        if self._on_stream_error is None:
+            return
+        result = _call_handler(self._on_stream_error, run, config)
+        await _maybe_await(result)
+
+
 def _call_handler(
-    listener: Callable[..., None],
+    listener: Callable[..., Any],
     run: TransableRun,
     config: TransableConfig,
-) -> None:
+) -> Any:
     try:
         params = inspect.signature(listener).parameters
     except (TypeError, ValueError):
-        with contextlib.suppress(Exception):
-            listener(run, config)
-        return
+        return _safe_call(listener, run, config)
     if any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in params.values()):
-        with contextlib.suppress(Exception):
-            listener(run, config)
-        return
+        return _safe_call(listener, run, config)
     positional_params = [
         param
         for param in params.values()
@@ -383,33 +537,24 @@ def _call_handler(
         )
     ]
     if len(positional_params) >= 2:
-        with contextlib.suppress(Exception):
-            listener(run, config)
-        return
+        return _safe_call(listener, run, config)
     if len(positional_params) == 1:
-        with contextlib.suppress(Exception):
-            listener(run)
-        return
-    with contextlib.suppress(Exception):
-        listener()
+        return _safe_call(listener, run)
+    return _safe_call(listener)
 
 
 def _call_stream_handler(
-    listener: Callable[..., None],
+    listener: Callable[..., Any],
     run: TransableRun,
     chunk: Any,
     config: TransableConfig,
-) -> None:
+) -> Any:
     try:
         params = inspect.signature(listener).parameters
     except (TypeError, ValueError):
-        with contextlib.suppress(Exception):
-            listener(run, chunk, config)
-        return
+        return _safe_call(listener, run, chunk, config)
     if any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in params.values()):
-        with contextlib.suppress(Exception):
-            listener(run, chunk, config)
-        return
+        return _safe_call(listener, run, chunk, config)
     positional_params = [
         param
         for param in params.values()
@@ -420,16 +565,9 @@ def _call_stream_handler(
         )
     ]
     if len(positional_params) >= 3:
-        with contextlib.suppress(Exception):
-            listener(run, chunk, config)
-        return
+        return _safe_call(listener, run, chunk, config)
     if len(positional_params) == 2:
-        with contextlib.suppress(Exception):
-            listener(run, chunk)
-        return
+        return _safe_call(listener, run, chunk)
     if len(positional_params) == 1:
-        with contextlib.suppress(Exception):
-            listener(chunk)
-        return
-    with contextlib.suppress(Exception):
-        listener()
+        return _safe_call(listener, chunk)
+    return _safe_call(listener)

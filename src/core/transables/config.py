@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 if TYPE_CHECKING:
     from uuid import UUID
 
-    from core.transables.tracing import TransableCallback
+    from core.transables.tracing import AsyncTransableCallback, TransableCallback
 
 P = ParamSpec("P")
 Output = TypeVar("Output")
@@ -35,7 +35,11 @@ class TransableConfig(TypedDict, total=False):
     max_concurrency: int | None
     stream_buffer: int
     recursion_limit: int
-    callbacks: list[TransableCallback] | TransableCallbackManager | None
+    callbacks: (
+        list[TransableCallback | AsyncTransableCallback]
+        | TransableCallbackManager
+        | None
+    )
     trace: bool
     run_id: UUID | None
 
@@ -72,9 +76,10 @@ var_child_transable_config: ContextVar[TransableConfig | None] = ContextVar(
 class TransableCallbackManager:
     def __init__(
         self,
-        handlers: Sequence[TransableCallback] | None = None,
+        handlers: Sequence[TransableCallback | AsyncTransableCallback] | None = None,
         *,
-        inheritable_handlers: Sequence[TransableCallback] | None = None,
+        inheritable_handlers: Sequence[TransableCallback | AsyncTransableCallback]
+        | None = None,
     ) -> None:
         self._handlers = list(handlers or [])
         if inheritable_handlers is None:
@@ -82,17 +87,22 @@ class TransableCallbackManager:
         else:
             self._inheritable_handlers = list(inheritable_handlers)
 
-    def add_handler(self, handler: TransableCallback, *, inherit: bool = True) -> None:
+    def add_handler(
+        self,
+        handler: TransableCallback | AsyncTransableCallback,
+        *,
+        inherit: bool = True,
+    ) -> None:
         self._handlers.append(handler)
         if inherit:
             self._inheritable_handlers.append(handler)
 
-    def append(self, handler: TransableCallback) -> None:
+    def append(self, handler: TransableCallback | AsyncTransableCallback) -> None:
         self.add_handler(handler, inherit=True)
 
     def extend(
         self,
-        handlers: Sequence[TransableCallback],
+        handlers: Sequence[TransableCallback | AsyncTransableCallback],
         *,
         inherit: bool = True,
     ) -> None:
@@ -121,17 +131,17 @@ class TransableCallbackManager:
         )
 
     @property
-    def handlers(self) -> list[TransableCallback]:
+    def handlers(self) -> list[TransableCallback | AsyncTransableCallback]:
         return list(self._handlers)
 
     @property
-    def inheritable_handlers(self) -> list[TransableCallback]:
+    def inheritable_handlers(self) -> list[TransableCallback | AsyncTransableCallback]:
         return list(self._inheritable_handlers)
 
-    def __iter__(self) -> Iterator[TransableCallback]:
+    def __iter__(self) -> Iterator[TransableCallback | AsyncTransableCallback]:
         return iter(self._handlers)
 
-    def __getitem__(self, index: int) -> TransableCallback:
+    def __getitem__(self, index: int) -> TransableCallback | AsyncTransableCallback:
         return self._handlers[index]
 
     def __len__(self) -> int:
@@ -163,8 +173,9 @@ class TransableConfigModel(BaseModel):
 
 
 def _copy_callbacks(
-    callbacks: list[TransableCallback] | TransableCallbackManager,
-) -> list[TransableCallback] | TransableCallbackManager:
+    callbacks: list[TransableCallback | AsyncTransableCallback]
+    | TransableCallbackManager,
+) -> list[TransableCallback | AsyncTransableCallback] | TransableCallbackManager:
     if isinstance(callbacks, TransableCallbackManager):
         return callbacks.copy()
     return list(callbacks)
@@ -181,7 +192,10 @@ def _copy_config_values(config: TransableConfig) -> TransableConfig:
             copied[key] = dict(cast("dict[str, Any]", value))
         elif key == "callbacks":
             copied[key] = _copy_callbacks(
-                cast("list[TransableCallback] | TransableCallbackManager", value)
+                cast(
+                    "list[TransableCallback | AsyncTransableCallback] | TransableCallbackManager",
+                    value,
+                )
             )
         else:
             copied[key] = value
@@ -189,9 +203,17 @@ def _copy_config_values(config: TransableConfig) -> TransableConfig:
 
 
 def _merge_callbacks(
-    base_callbacks: list[TransableCallback] | TransableCallbackManager | None,
-    new_callbacks: list[TransableCallback] | TransableCallbackManager | None,
-) -> list[TransableCallback] | TransableCallbackManager | None:
+    base_callbacks: (
+        list[TransableCallback | AsyncTransableCallback]
+        | TransableCallbackManager
+        | None
+    ),
+    new_callbacks: (
+        list[TransableCallback | AsyncTransableCallback]
+        | TransableCallbackManager
+        | None
+    ),
+) -> list[TransableCallback | AsyncTransableCallback] | TransableCallbackManager | None:
     if new_callbacks is None:
         return base_callbacks
     if base_callbacks is None:
@@ -288,7 +310,11 @@ def patch_config(
     max_concurrency: int | None = None,
     stream_buffer: int | None = None,
     recursion_limit: int | None = None,
-    callbacks: list[TransableCallback] | TransableCallbackManager | None = None,
+    callbacks: (
+        list[TransableCallback | AsyncTransableCallback]
+        | TransableCallbackManager
+        | None
+    ) = None,
     trace: bool | None = None,
     run_id: UUID | None = None,
     child: bool = False,
@@ -349,7 +375,10 @@ def merge_configs(*configs: TransableConfig | None) -> TransableConfig:
             elif key == "callbacks":
                 base["callbacks"] = _merge_callbacks(
                     base.get("callbacks"),
-                    cast("list[TransableCallback] | TransableCallbackManager", value),
+                    cast(
+                        "list[TransableCallback | AsyncTransableCallback] | TransableCallbackManager",
+                        value,
+                    ),
                 )
             elif key == "trace":
                 base["trace"] = bool(value) or bool(base.get("trace", False))

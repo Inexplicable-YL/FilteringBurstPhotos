@@ -43,6 +43,7 @@ from core.transables.serializable import (
     SerializedNotImplemented,
 )
 from core.transables.tracing import (
+    AsyncTransableListener,
     TransableListener,
     TransableRun,
     aiter_with_tracing,
@@ -70,6 +71,14 @@ from core.transables.utils import (
 
 if TYPE_CHECKING:
     from anyio.abc import ObjectReceiveStream, ObjectSendStream
+
+Listener = (
+    Callable[[TransableRun], None] | Callable[[TransableRun, TransableConfig], None]
+)
+AsyncListener = (
+    Callable[[TransableRun], Awaitable[None]]
+    | Callable[[TransableRun, TransableConfig], Awaitable[None]]
+)
 
 
 class Transable(ABC, Generic[Input, PhotoType]):
@@ -364,18 +373,53 @@ class Transable(ABC, Generic[Input, PhotoType]):
     def with_listeners(
         self,
         *,
-        on_start: Callable[[TransableRun, TransableConfig], None] | None = None,
-        on_end: Callable[[TransableRun, TransableConfig], None] | None = None,
-        on_error: Callable[[TransableRun, TransableConfig], None] | None = None,
-        on_stream_start: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_start: Listener | None = None,
+        on_end: Listener | None = None,
+        on_error: Listener | None = None,
+        on_stream_start: Listener | None = None,
         on_stream_chunk: Callable[[TransableRun, Any, TransableConfig], None]
         | None = None,
-        on_stream_end: Callable[[TransableRun, TransableConfig], None] | None = None,
-        on_stream_error: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_stream_end: Listener | None = None,
+        on_stream_error: Listener | None = None,
     ) -> Transable[Input, PhotoType]:
         """Bind lifecycle listeners to a Transable."""
 
         listener = TransableListener(
+            on_start=on_start,
+            on_end=on_end,
+            on_error=on_error,
+            on_stream_start=on_stream_start,
+            on_stream_chunk=on_stream_chunk,
+            on_stream_end=on_stream_end,
+            on_stream_error=on_stream_error,
+        )
+
+        def listener_factory(_config: TransableConfig) -> TransableConfig:
+            return {
+                "callbacks": [listener],
+                "trace": True,
+            }
+
+        return TransableBinding(
+            bound=self,
+            config_factories=[listener_factory],
+        )
+
+    def with_alisteners(
+        self,
+        *,
+        on_start: AsyncListener | None = None,
+        on_end: AsyncListener | None = None,
+        on_error: AsyncListener | None = None,
+        on_stream_start: AsyncListener | None = None,
+        on_stream_chunk: Callable[[TransableRun, Any, TransableConfig], Awaitable[None]]
+        | None = None,
+        on_stream_end: AsyncListener | None = None,
+        on_stream_error: AsyncListener | None = None,
+    ) -> Transable[Input, PhotoType]:
+        """Bind async lifecycle listeners to a Transable."""
+
+        listener = AsyncTransableListener(
             on_start=on_start,
             on_end=on_end,
             on_error=on_error,
@@ -1531,18 +1575,58 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
     def with_listeners(
         self,
         *,
-        on_start: Callable[[TransableRun, TransableConfig], None] | None = None,
-        on_end: Callable[[TransableRun, TransableConfig], None] | None = None,
-        on_error: Callable[[TransableRun, TransableConfig], None] | None = None,
-        on_stream_start: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_start: Listener | None = None,
+        on_end: Listener | None = None,
+        on_error: Listener | None = None,
+        on_stream_start: Listener | None = None,
         on_stream_chunk: Callable[[TransableRun, Any, TransableConfig], None]
         | None = None,
-        on_stream_end: Callable[[TransableRun, TransableConfig], None] | None = None,
-        on_stream_error: Callable[[TransableRun, TransableConfig], None] | None = None,
+        on_stream_end: Listener | None = None,
+        on_stream_error: Listener | None = None,
     ) -> Transable[Input, PhotoType]:
         """Bind lifecycle listeners to a Transable."""
 
         listener = TransableListener(
+            on_start=on_start,
+            on_end=on_end,
+            on_error=on_error,
+            on_stream_start=on_stream_start,
+            on_stream_chunk=on_stream_chunk,
+            on_stream_end=on_stream_end,
+            on_stream_error=on_stream_error,
+        )
+
+        def listener_factory(_config: TransableConfig) -> TransableConfig:
+            return {
+                "callbacks": [listener],
+                "trace": True,
+            }
+
+        return self.__class__(
+            bound=self.bound,
+            kwargs=self.kwargs,
+            config=self.config,
+            config_factories=[listener_factory, *self.config_factories],
+            custom_input_type=self.custom_input_type,
+            custom_photo_type=self.custom_photo_type,
+        )
+
+    @override
+    def with_alisteners(
+        self,
+        *,
+        on_start: AsyncListener | None = None,
+        on_end: AsyncListener | None = None,
+        on_error: AsyncListener | None = None,
+        on_stream_start: AsyncListener | None = None,
+        on_stream_chunk: Callable[[TransableRun, Any, TransableConfig], Awaitable[None]]
+        | None = None,
+        on_stream_end: AsyncListener | None = None,
+        on_stream_error: AsyncListener | None = None,
+    ) -> Transable[Input, PhotoType]:
+        """Bind async lifecycle listeners to a Transable."""
+
+        listener = AsyncTransableListener(
             on_start=on_start,
             on_end=on_end,
             on_error=on_error,
