@@ -278,7 +278,7 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
             cache,
         )
         child_config = patch_config(config, child=True)
-        result = await branch.invoke(
+        result = await branch.ainvoke(
             input,
             receive_value,
             config=child_config,
@@ -287,7 +287,7 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
         return coerce_photo(result, self.PhotoType)
 
     @override
-    async def invoke(
+    async def ainvoke(
         self,
         input: Input,
         receive: PhotoType | None = None,
@@ -296,7 +296,7 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
     ) -> PhotoType:
         config = ensure_config(config)
 
-        return await self._call_with_config(
+        return await self._acall_with_config(
             self._invoke,
             input,
             receive,
@@ -327,7 +327,7 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
             child_config = patch_config(config, child=True)
             stream_iter = run_in_context(
                 child_config,
-                branch.stream,
+                branch.astream,
                 input,
                 None,
                 child_config,
@@ -342,7 +342,7 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
             child_config = patch_config(config, child=True)
             stream_iter = run_in_context(
                 child_config,
-                branch.stream,
+                branch.astream,
                 input,
                 receives,
                 child_config,
@@ -377,7 +377,7 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
             child_config = patch_config(config, child=True)
             stream_iter = run_in_context(
                 child_config,
-                branch.stream,
+                branch.astream,
                 input,
                 _empty_stream(),
                 child_config,
@@ -449,7 +449,7 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
                     child_config = patch_config(config, child=True)
                     stream_iter = run_in_context(
                         child_config,
-                        branch.stream,
+                        branch.astream,
                         input,
                         branch_recvs[idx],
                         child_config,
@@ -504,7 +504,7 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
                 yield coerce_photo(output, self.PhotoType)
 
     @override
-    async def stream(
+    async def astream(
         self,
         input: Input,
         receives: AsyncIterator[PhotoType] | None = None,
@@ -513,7 +513,7 @@ class TransableBranch(TransableSerializable[Input, PhotoType]):
     ) -> AsyncIterator[PhotoType]:
         config = ensure_config(config)
 
-        async for result in self._stream_with_config(
+        async for result in self._astream_with_config(
             self._stream,
             input,
             receives,

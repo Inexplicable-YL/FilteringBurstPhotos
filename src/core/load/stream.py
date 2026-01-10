@@ -61,7 +61,7 @@ class StreamLoader(Transable[Photo, LoadInput]):
         self._photos_by_path: dict[Path, Photo] = {}
 
     @override
-    async def invoke(
+    async def ainvoke(
         self,
         input: LoadInput,
         receive: PhotoResult[Photo] | None = None,
@@ -69,14 +69,14 @@ class StreamLoader(Transable[Photo, LoadInput]):
         **kwargs: object,
     ) -> PhotoResult[Photo]:
         last: PhotoResult[Photo] | None = None
-        async for snapshot in self.stream(input, None, config or {}, **kwargs):
+        async for snapshot in self.astream(input, None, config or {}, **kwargs):
             last = snapshot
         if last is None:
             return PhotoResult[Photo](photos=[], done=True)
         return last
 
     @override
-    async def stream(
+    async def astream(
         self,
         input: LoadInput,
         receives: AsyncIterator[PhotoResult[Photo]] | None = None,

@@ -157,6 +157,21 @@ def accepts_receives(callable: Callable[..., Any]) -> bool:  # noqa: A002
         return False
 
 
+def accepts_any(callable: Callable[..., Any], key: str) -> bool:  # noqa: A002
+    """Check if a callable accepts a receives argument.
+
+    Args:
+        callable: The callable to check.
+
+    Returns:
+        bool: True if the callable accepts a receives argument, False otherwise.
+    """
+    try:
+        return inspect.signature(callable).parameters.get(key) is not None
+    except ValueError:
+        return False
+
+
 def _config_for_call(config: TransableConfig | None) -> TransableConfig:
     if config is not None and (config.get("callbacks") or config.get("trace")):
         return patch_config(config, child=True)
@@ -166,13 +181,10 @@ def _config_for_call(config: TransableConfig | None) -> TransableConfig:
 def call_func_with_variable_args(
     func: Callable[[Input], Output]
     | Callable[[Input, TransableConfig], Output]
-    | Callable[[Input, PhotoType, TransableConfig], Output]
-    | Callable[[Input, Iterator[PhotoType]], Output]
-    | Callable[[Input, AsyncIterator[PhotoType]], Output]
-    | Callable[[Input, Iterator[PhotoType], TransableConfig], Output]
-    | Callable[[Input, AsyncIterator[PhotoType], TransableConfig], Output],
+    | Callable[[Input, Any], Output]
+    | Callable[[Input, Any, TransableConfig], Output],
     input: Input,
-    all_receive: PhotoType | Iterator[PhotoType] | AsyncIterator[PhotoType] | None,
+    all_receive: PhotoType | Iterator[PhotoType] | AsyncIterator[PhotoType] | Any,
     config: TransableConfig | None,
     **kwargs: Any,
 ) -> Output:
@@ -191,10 +203,8 @@ def call_func_with_variable_args(
         kwargs["config"] = config_for_call
     if accepts_receive(func) and not isinstance(all_receive, Iterator | AsyncIterator):
         kwargs["receive"] = all_receive
-    elif accepts_receives(func) and (
-        isinstance(all_receive, Iterator | AsyncIterator) or all_receive is None
-    ):
-        if not isinstance(all_receive, AsyncIterator) and all_receive is not None:
+    elif accepts_receives(func) and (isinstance(all_receive, Iterator | AsyncIterator)):
+        if not isinstance(all_receive, AsyncIterator):
 
             async def async_wrapper(
                 iterator: Iterator[PhotoType],
@@ -210,13 +220,10 @@ def call_func_with_variable_args(
 async def acall_func_with_variable_args(
     func: Callable[[Input], Awaitable[Output]]
     | Callable[[Input, TransableConfig], Awaitable[Output]]
-    | Callable[[Input, PhotoType, TransableConfig], Awaitable[Output]]
-    | Callable[[Input, Iterator[PhotoType]], Awaitable[Output]]
-    | Callable[[Input, AsyncIterator[PhotoType]], Awaitable[Output]]
-    | Callable[[Input, Iterator[PhotoType], TransableConfig], Awaitable[Output]]
-    | Callable[[Input, AsyncIterator[PhotoType], TransableConfig], Awaitable[Output]],
+    | Callable[[Input, Any], Awaitable[Output]]
+    | Callable[[Input, Any, TransableConfig], Awaitable[Output]],
     input: Input,
-    all_receive: PhotoType | Iterator[PhotoType] | AsyncIterator[PhotoType] | None,
+    all_receive: PhotoType | Iterator[PhotoType] | AsyncIterator[PhotoType] | Any,
     config: TransableConfig | None,
     **kwargs: Any,
 ) -> Output:
@@ -235,10 +242,8 @@ async def acall_func_with_variable_args(
         kwargs["config"] = config_for_call
     if accepts_receive(func) and not isinstance(all_receive, Iterator | AsyncIterator):
         kwargs["receive"] = all_receive
-    elif accepts_receives(func) and (
-        isinstance(all_receive, Iterator | AsyncIterator) or all_receive is None
-    ):
-        if not isinstance(all_receive, AsyncIterator) and all_receive is not None:
+    elif accepts_receives(func) and (isinstance(all_receive, Iterator | AsyncIterator)):
+        if not isinstance(all_receive, AsyncIterator):
 
             async def async_wrapper(
                 iterator: Iterator[PhotoType],
@@ -248,9 +253,7 @@ async def acall_func_with_variable_args(
 
             all_receive = async_wrapper(all_receive)
         kwargs["receives"] = all_receive
-    return await arun_in_context(
-        config_for_call, func, input, **kwargs  # type: ignore[arg-type]
-    )
+    return await arun_in_context(config_for_call, func, input, **kwargs)  # type: ignore[arg-type]
 
 
 def is_generator(func: Any) -> TypeGuard[Callable[..., Iterator]]:
