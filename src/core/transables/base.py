@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import queue
+import threading
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -29,6 +31,7 @@ from typing import (
 from typing_extensions import override
 
 import anyio
+from anyio import BrokenResourceError, ClosedResourceError
 from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from core.transables.config import (
@@ -64,6 +67,10 @@ from core.transables.utils import (
     OtherPhotoType,
     Output,
     PhotoType,
+    acall_func_with_variable_args,
+    accepts_config,
+    accepts_receive,
+    accepts_receives,
     call_func_with_variable_args,
     clone_photo,
     coerce_photo,
@@ -1362,7 +1369,79 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         return_exceptions: bool = False,
         **kwargs: Any | None,
     ) -> Sequence[PhotoType | Exception]:
-        raise NotImplementedError
+        total = 1 if receives is None else len(receives)
+        if total == 0:
+            return []
+
+        failed: dict[int, Exception] = {}
+        current: list[PhotoType] | None = receives
+
+        for transable in self.chains:
+            child_config = patch_config(config, child=True)
+            if return_exceptions:
+                remaining_idxs = [i for i in range(total) if i not in failed]
+                if not remaining_idxs:
+                    break
+                step_receives = current if current is not None else None
+                try:
+                    step_results = list(
+                        run_in_context(
+                            child_config,
+                            transable.batch,
+                            input,
+                            step_receives,
+                            child_config,
+                            return_exceptions=True,
+                            **kwargs,
+                        )
+                    )
+                except Exception as exc:
+                    for idx in remaining_idxs:
+                        failed[idx] = exc
+                    current = []
+                    break
+
+                failed = failed | {
+                    idx: res
+                    for idx, res in zip(remaining_idxs, step_results, strict=False)
+                    if isinstance(res, Exception)
+                }
+                current = [
+                    cast("PhotoType", res)
+                    for res in step_results
+                    if not isinstance(res, Exception)
+                ]
+            else:
+                current = list(
+                    cast(
+                        "Sequence[PhotoType]",
+                        run_in_context(
+                            child_config,
+                            transable.batch,
+                            input,
+                            current,
+                            child_config,
+                            return_exceptions=False,
+                            **kwargs,
+                        ),
+                    )
+                )
+
+        if return_exceptions:
+            outputs: list[PhotoType | Exception] = []
+            successes = list(cast("list[PhotoType]", current or []))
+            for i in range(total):
+                if i in failed:
+                    outputs.append(failed[i])
+                else:
+                    if not successes:
+                        raise RuntimeError(
+                            "Sequence batch did not return results for all inputs."
+                        )
+                    outputs.append(successes.pop(0))
+            return outputs
+
+        return current or []
 
     @overload
     def batch(
@@ -1417,7 +1496,79 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         return_exceptions: bool = False,
         **kwargs: Any | None,
     ) -> Sequence[PhotoType | Exception]:
-        raise NotImplementedError
+        total = 1 if receives is None else len(receives)
+        if total == 0:
+            return []
+
+        failed: dict[int, Exception] = {}
+        current: list[PhotoType] | None = receives
+
+        for transable in self.chains:
+            child_config = patch_config(config, child=True)
+            if return_exceptions:
+                remaining_idxs = [i for i in range(total) if i not in failed]
+                if not remaining_idxs:
+                    break
+                step_receives = current if current is not None else None
+                try:
+                    step_results = list(
+                        await arun_in_context(
+                            child_config,
+                            transable.abatch,
+                            input,
+                            step_receives,
+                            child_config,
+                            return_exceptions=True,
+                            **kwargs,
+                        )
+                    )
+                except Exception as exc:
+                    for idx in remaining_idxs:
+                        failed[idx] = exc
+                    current = []
+                    break
+
+                failed = failed | {
+                    idx: res
+                    for idx, res in zip(remaining_idxs, step_results, strict=False)
+                    if isinstance(res, Exception)
+                }
+                current = [
+                    cast("PhotoType", res)
+                    for res in step_results
+                    if not isinstance(res, Exception)
+                ]
+            else:
+                current = list(
+                    cast(
+                        "Sequence[PhotoType]",
+                        await arun_in_context(
+                            child_config,
+                            transable.abatch,
+                            input,
+                            current,
+                            child_config,
+                            return_exceptions=False,
+                            **kwargs,
+                        ),
+                    )
+                )
+
+        if return_exceptions:
+            outputs: list[PhotoType | Exception] = []
+            successes = list(cast("list[PhotoType]", current or []))
+            for i in range(total):
+                if i in failed:
+                    outputs.append(failed[i])
+                else:
+                    if not successes:
+                        raise RuntimeError(
+                            "Sequence batch did not return results for all inputs."
+                        )
+                    outputs.append(successes.pop(0))
+            return outputs
+
+        return current or []
 
     @overload
     async def abatch(
@@ -1558,7 +1709,6 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
             )
 
 
-# Incomplete revisions
 class TransableParallel(TransableSerializable[Input, PhotoType]):
     steps: list[Transable[Input, PhotoType]] = Field(default_factory=list)
 
@@ -1646,7 +1796,8 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
             )
             results[idx] = coerce_photo(res, self.PhotoType)
 
-        with get_executor_for_config(config) as executor:
+        executor_config = patch_config(config, max_concurrency=len(self.steps) + 1)
+        with get_executor_for_config(executor_config) as executor:
             executor.map(_run, range(len(self.steps)), self.steps)
 
         if any(res is None for res in results):
@@ -1669,7 +1820,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
             input,
             receive,
             config,
-            run_type="invoke",
+            run_type="parallel_invoke",
             **kwargs,
         )
 
@@ -1721,7 +1872,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
             input,
             receive,
             config,
-            run_type="ainvoke",
+            run_type="parallel_ainvoke",
             **kwargs,
         )
 
@@ -1735,7 +1886,283 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         ignore_exceptions: bool = False,
         **kwargs: Any,
     ) -> Iterator[PhotoType]:
-        raise NotImplementedError
+        if receives is None:
+            raise ValueError(
+                "Parallel Transables require an input PhotoResult stream when streamed."
+            )
+
+        buffer_size = stream_buffer(config)
+        sentinel = object()
+        cond = threading.Condition()
+        step_outputs: dict[str, list[PhotoType | None]] = defaultdict(
+            lambda: [None] * len(self.steps)
+        )
+        base_items: dict[str, PhotoType] = {}
+        pending: set[str] | None = set() if not keep_order else None
+        step_done: list[bool] = [False] * len(self.steps)
+        base_done = False
+        errors: list[Exception] = []
+        fatal_error: Exception | None = None
+        arrived_count: dict[str, int] = {}
+        ready_queue: deque[str] = deque()
+        stop_event = threading.Event()
+
+        base_queue: queue.Queue[object] | None = None
+        if keep_order:
+            base_queue = queue.Queue()
+
+        child_queues: list[queue.Queue[object]] = [
+            queue.Queue(maxsize=buffer_size) for _ in self.steps
+        ]
+
+        def _queue_iter(q: queue.Queue[object]) -> Iterator[PhotoType]:
+            while True:
+                if stop_event.is_set() and q.empty():
+                    return
+                try:
+                    item = q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if item is sentinel or stop_event.is_set():
+                    return
+                yield cast("PhotoType", item)
+
+        def _put_queue(q: queue.Queue[object], item: object) -> None:
+            while True:
+                if stop_event.is_set():
+                    return
+                try:
+                    q.put(item, timeout=0.1)
+                except queue.Full:
+                    continue
+                else:
+                    return
+
+        def _broadcast() -> None:
+            nonlocal base_done, fatal_error
+            try:
+                for item in receives:
+                    if stop_event.is_set():
+                        break
+                    coerced = coerce_photo(item, self.PhotoType)
+                    base_item = clone_photo(coerced)
+                    unique_id = base_item.get_unique_id()
+                    with cond:
+                        if any(step_done):
+                            if not ignore_exceptions:
+                                fatal_error = ValueError(
+                                    "A parallel step finished early; cannot continue streaming."
+                                )
+                                cond.notify_all()
+                                break
+                            return
+                        base_items[unique_id] = base_item
+                        arrived_count[unique_id] = 0
+                        if pending is not None:
+                            pending.add(unique_id)
+                        cond.notify_all()
+                    if base_queue is not None:
+                        _put_queue(base_queue, base_item)
+                    for q in child_queues:
+                        _put_queue(q, clone_photo(coerced))
+            except Exception as exc:
+                with cond:
+                    fatal_error = exc
+                    cond.notify_all()
+            finally:
+                with cond:
+                    base_done = True
+                    cond.notify_all()
+                if base_queue is not None:
+                    _put_queue(base_queue, sentinel)
+                for q in child_queues:
+                    _put_queue(q, sentinel)
+
+        def _run_step(idx: int, step: Transable[Input, PhotoType]) -> None:
+            try:
+                child_config = patch_config(config, child=True)
+                stream_iter = run_in_context(
+                    child_config,
+                    step.stream,
+                    input,
+                    _queue_iter(child_queues[idx]),
+                    child_config,
+                    keep_order=keep_order,
+                    ignore_exceptions=ignore_exceptions,
+                    **kwargs,
+                )
+                for result in stream_iter:
+                    coerced = coerce_photo(result, self.PhotoType)
+                    unique_id = coerced.get_unique_id()
+                    with cond:
+                        if (
+                            unique_id not in base_items
+                            and unique_id not in step_outputs
+                        ):
+                            if ignore_exceptions:
+                                continue
+                            errors.append(
+                                ValueError(
+                                    "Parallel step produced results with no matching base item: "
+                                    f"{unique_id}"
+                                )
+                            )
+                            cond.notify_all()
+                            return
+                        outputs = step_outputs[unique_id]
+                        if outputs[idx] is None:
+                            arrived_count[unique_id] = (
+                                arrived_count.get(unique_id, 0) + 1
+                            )
+                        outputs[idx] = clone_photo(coerced)
+                        if (
+                            pending is not None
+                            and unique_id in pending
+                            and arrived_count.get(unique_id, 0) == len(self.steps)
+                        ):
+                            ready_queue.append(unique_id)
+                        cond.notify_all()
+            except Exception as exc:
+                if not ignore_exceptions:
+                    with cond:
+                        errors.append(exc)
+                        cond.notify_all()
+                    stop_event.set()
+            finally:
+                with cond:
+                    step_done[idx] = True
+                    if pending is not None and pending:
+                        missing_ids = [
+                            uid for uid in pending if step_outputs[uid][idx] is None
+                        ]
+                        if missing_ids:
+                            if ignore_exceptions:
+                                for unique_id in missing_ids:
+                                    pending.remove(unique_id)
+                                    base_items.pop(unique_id, None)
+                                    step_outputs.pop(unique_id, None)
+                                    arrived_count.pop(unique_id, None)
+                            else:
+                                errors.append(
+                                    ValueError(
+                                        "Parallel step results missing for unique ID(s): "
+                                        f"{', '.join(missing_ids)}."
+                                    )
+                                )
+                    cond.notify_all()
+
+        def _collect_ordered() -> Iterator[PhotoType]:
+            assert base_queue is not None
+            while True:
+                base_item = base_queue.get()
+                if base_item is sentinel:
+                    break
+                base_item = cast("PhotoType", base_item)
+                unique_id = base_item.get_unique_id()
+                while True:
+                    with cond:
+                        if fatal_error is not None:
+                            raise fatal_error
+                        if errors and not ignore_exceptions:
+                            raise errors[0]
+                        outputs = step_outputs[unique_id]
+                        missing = [
+                            idx for idx, res in enumerate(outputs) if res is None
+                        ]
+                        if not missing:
+                            step_outputs.pop(unique_id, None)
+                            base_items.pop(unique_id, None)
+                            merged = merge_photos(
+                                base_item,
+                                cast("list[PhotoType]", list(outputs)),
+                            )
+                            arrived_count.pop(unique_id, None)
+                            break
+                        if any(step_done[idx] for idx in missing):
+                            step_outputs.pop(unique_id, None)
+                            base_items.pop(unique_id, None)
+                            arrived_count.pop(unique_id, None)
+                            if ignore_exceptions:
+                                merged = None
+                                break
+                            raise ValueError(
+                                "Parallel step results missing for unique ID "
+                                f"{unique_id}."
+                            )
+                        cond.wait()
+                if merged is not None:
+                    yield merged
+
+            with cond:
+                if fatal_error is not None:
+                    raise fatal_error
+                if errors and not ignore_exceptions:
+                    raise errors[0]
+                if step_outputs and not ignore_exceptions:
+                    raise ValueError(
+                        "Parallel step produced results with no matching base item: "
+                        f"{', '.join(step_outputs.keys())}"
+                    )
+
+        def _collect_unordered() -> Iterator[PhotoType]:
+            assert pending is not None
+            while True:
+                with cond:
+                    if fatal_error is not None:
+                        raise fatal_error
+                    if errors and not ignore_exceptions:
+                        raise errors[0]
+                    while not ready_queue:
+                        if base_done and not pending:
+                            break
+                        cond.wait()
+                        if fatal_error is not None:
+                            raise fatal_error
+                        if errors and not ignore_exceptions:
+                            raise errors[0]
+                    if base_done and not pending and not ready_queue:
+                        break
+                    unique_id = ready_queue.popleft()
+                    if unique_id not in pending:
+                        continue
+                    base_item = base_items.pop(unique_id)
+                    outputs = step_outputs.pop(unique_id, None)
+                    pending.remove(unique_id)
+                    arrived_count.pop(unique_id, None)
+                if outputs is not None:
+                    outs = cast("list[PhotoType]", list(outputs))
+                    yield merge_photos(base_item, outs)
+
+            with cond:
+                if fatal_error is not None:
+                    raise fatal_error
+                if errors and not ignore_exceptions:
+                    raise errors[0]
+                if step_outputs and not ignore_exceptions:
+                    raise ValueError(
+                        "Parallel step produced results with no matching base item: "
+                        f"{', '.join(step_outputs.keys())}"
+                    )
+
+        executor_config = patch_config(config, max_concurrency=len(self.steps) + 1)
+        with get_executor_for_config(executor_config) as executor:
+            futures = [executor.submit(_broadcast)]
+            futures.extend(
+                executor.submit(_run_step, idx, step)
+                for idx, step in enumerate(self.steps)
+            )
+            try:
+                if keep_order:
+                    yield from _collect_ordered()
+                else:
+                    yield from _collect_unordered()
+            finally:
+                stop_event.set()
+                if base_queue is not None:
+                    _put_queue(base_queue, sentinel)
+                for q in child_queues:
+                    _put_queue(q, sentinel)
+                wait(futures)
 
     @override
     def stream(
@@ -1757,7 +2184,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
             config,
             keep_order=keep_order,
             ignore_exceptions=ignore_exceptions,
-            run_type="stream",
+            run_type="parallel_stream",
             **kwargs,
         )
 
@@ -1771,42 +2198,84 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         ignore_exceptions: bool = False,
         **kwargs: Any,
     ) -> AsyncIterator[PhotoType]:
-        # raise NotImplementedError
         if receives is None:
             raise ValueError(
                 "Parallel Transables require an input PhotoResult stream when streamed."
             )
+
         buffer_size = stream_buffer(config)
+        base_items: dict[str, PhotoType] = {}
+        pending: set[str] | None = set() if not keep_order else None
+        base_done = False
         step_outputs: dict[str, list[PhotoType | None]] = defaultdict(
             lambda: [None] * len(self.steps)
         )
 
-        # Use an unbounded base stream to avoid backpressure deadlocks when downstream
-        # steps need to buffer multiple items before yielding.
-        base_send, base_recv = anyio.create_memory_object_stream[PhotoType](
-            max_buffer_size=buffer_size
-        )
+        arrived_count: dict[str, int] = {}
+        ready_queue: deque[str] = deque()
+
+        base_send: ObjectSendStream[PhotoType] | None = None
+        base_recv: ObjectReceiveStream[PhotoType] | None = None
+        if keep_order:
+            base_send, base_recv = anyio.create_memory_object_stream[PhotoType](
+                max_buffer_size=buffer_size
+            )
+
         child_sends: list[ObjectSendStream[PhotoType]] = []
         child_recvs: list[ObjectReceiveStream[PhotoType]] = []
         for _ in self.steps:
-            s, r = anyio.create_memory_object_stream(max_buffer_size=buffer_size)
+            s, r = anyio.create_memory_object_stream[PhotoType](
+                max_buffer_size=buffer_size
+            )
             child_sends.append(s)
             child_recvs.append(r)
 
-        outpot_cond: anyio.Condition = anyio.Condition()
+        output_cond: anyio.Condition = anyio.Condition()
         step_done: list[bool] = [False] * len(self.steps)
 
         async def _broadcast() -> None:
+            nonlocal base_done
+            active_child_sends: list[ObjectSendStream[PhotoType]] = list(child_sends)
             try:
                 async for item in receives:
                     coerced = coerce_photo(item, self.PhotoType)
-                    await base_send.send(clone_photo(coerced))
-                    for send in child_sends:
-                        await send.send(clone_photo(coerced))
+                    base_item = clone_photo(coerced)
+                    unique_id = base_item.get_unique_id()
+                    async with output_cond:
+                        if any(step_done):
+                            if not ignore_exceptions:
+                                raise ValueError(
+                                    "A parallel step finished early; cannot continue streaming."
+                                )
+                            return
+                        base_items[unique_id] = base_item
+                        arrived_count[unique_id] = 0
+                        if pending is not None:
+                            pending.add(unique_id)
+                        output_cond.notify_all()
+                    if base_send is not None:
+                        await base_send.send(base_item)
+
+                    to_remove: list[ObjectSendStream[PhotoType]] = []
+                    for send in list(active_child_sends):
+                        try:
+                            await send.send(clone_photo(coerced))
+                        except (BrokenResourceError, ClosedResourceError):
+                            if not ignore_exceptions:
+                                raise
+                            to_remove.append(send)
+                    if to_remove:
+                        active_child_sends = [
+                            send for send in active_child_sends if send not in to_remove
+                        ]
             finally:
-                await base_send.aclose()
+                if base_send is not None:
+                    await base_send.aclose()
                 for send in child_sends:
                     await send.aclose()
+                async with output_cond:
+                    base_done = True
+                    output_cond.notify_all()
 
         async def _run_step(idx: int, step: Transable[Input, PhotoType]) -> None:
             try:
@@ -1818,50 +2287,125 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                         input,
                         child_recvs[idx],
                         child_config,
+                        keep_order=keep_order,
+                        ignore_exceptions=ignore_exceptions,
                         **kwargs,
                     )
                     async for result in stream_iter:
                         coerced = coerce_photo(result, self.PhotoType)
-                        async with outpot_cond:
-                            step_outputs[coerced.get_unique_id()][idx] = clone_photo(
-                                coerced
-                            )
-                            outpot_cond.notify_all()
+                        unique_id = coerced.get_unique_id()
+                        async with output_cond:
+                            if (
+                                unique_id not in base_items
+                                and unique_id not in step_outputs
+                            ):
+                                if ignore_exceptions:
+                                    continue
+                                raise ValueError(
+                                    "Parallel step produced results with no matching base item: "
+                                    f"{unique_id}"
+                                )
+                            outputs = step_outputs[unique_id]
+                            if outputs[idx] is None:
+                                arrived_count[unique_id] = (
+                                    arrived_count.get(unique_id, 0) + 1
+                                )
+                            outputs[idx] = clone_photo(coerced)
+                            if (
+                                pending is not None
+                                and unique_id in pending
+                                and arrived_count.get(unique_id, 0) == len(self.steps)
+                            ):
+                                ready_queue.append(unique_id)
+                            output_cond.notify_all()
+            except Exception:
+                if not ignore_exceptions:
+                    raise
             finally:
-                async with outpot_cond:
+                async with output_cond:
                     step_done[idx] = True
-                    outpot_cond.notify_all()
 
-        async def _collect_outputs() -> AsyncIterator[PhotoType]:
+                    if pending is not None and pending:
+                        missing_ids = [
+                            uid for uid in pending if step_outputs[uid][idx] is None
+                        ]
+                        if missing_ids:
+                            if ignore_exceptions:
+                                for unique_id in missing_ids:
+                                    pending.remove(unique_id)
+                                    base_items.pop(unique_id, None)
+                                    step_outputs.pop(unique_id, None)
+                                    arrived_count.pop(unique_id, None)
+                            else:
+                                raise ValueError(
+                                    "Parallel step results missing for unique ID(s): "
+                                    f"{', '.join(missing_ids)}."
+                                )
+
+                    output_cond.notify_all()
+
+        async def _collect_outputs_ordered() -> AsyncIterator[PhotoType]:
+            assert base_recv is not None
             async with base_recv:
                 async for base_item in base_recv:
                     unique_id = base_item.get_unique_id()
+
                     while True:
-                        async with outpot_cond:
+                        async with output_cond:
                             outputs = step_outputs[unique_id]
                             missing = [
-                                idx for idx, res in enumerate(outputs) if res is None
+                                i for i, res in enumerate(outputs) if res is None
                             ]
                             if not missing:
-                                merged = merge_photos(
-                                    base_item,
-                                    cast(
-                                        "list[PhotoType]",
-                                        outputs,
-                                    ),
-                                )
+                                outs = cast("list[PhotoType]", list(outputs))
                                 step_outputs.pop(unique_id, None)
-                                yield merged
+                                base_items.pop(unique_id, None)
+                                arrived_count.pop(unique_id, None)
                                 break
-                            if any(step_done[idx] for idx in missing):
+                            if any(step_done[i] for i in missing):
                                 step_outputs.pop(unique_id, None)
+                                base_items.pop(unique_id, None)
+                                arrived_count.pop(unique_id, None)
+                                if ignore_exceptions:
+                                    outs = None
+                                    break
                                 raise ValueError(
                                     "Parallel step results missing for unique ID "
                                     f"{unique_id}."
                                 )
-                            await outpot_cond.wait()
-                # Base stream exhausted; if steps emitted unmatched IDs, surface them.
-                if step_outputs:
+                            await output_cond.wait()
+                    if outs is not None:
+                        yield merge_photos(base_item, outs)
+                async with output_cond:
+                    if step_outputs and not ignore_exceptions:
+                        raise ValueError(
+                            "Parallel step produced results with no matching base item: "
+                            f"{', '.join(step_outputs.keys())}"
+                        )
+
+        async def _collect_outputs_unordered() -> AsyncIterator[PhotoType]:
+            assert pending is not None
+            while True:
+                async with output_cond:
+                    while not ready_queue:
+                        if base_done and not pending:
+                            break
+                        await output_cond.wait()
+                    if base_done and not pending and not ready_queue:
+                        break
+                    uid = ready_queue.popleft()
+                    if uid not in pending:
+                        continue
+                    base_item = base_items.pop(uid)
+                    outputs = step_outputs.pop(uid, None)
+                    pending.remove(uid)
+                    arrived_count.pop(uid, None)
+                if outputs is not None:
+                    outs = cast("list[PhotoType]", list(outputs))
+                    yield merge_photos(base_item, outs)
+
+            async with output_cond:
+                if step_outputs and not ignore_exceptions:
                     raise ValueError(
                         "Parallel step produced results with no matching base item: "
                         f"{', '.join(step_outputs.keys())}"
@@ -1871,8 +2415,12 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
             tg.start_soon(_broadcast)
             for idx, step in enumerate(self.steps):
                 tg.start_soon(_run_step, idx, step)
-            async for output in _collect_outputs():
-                yield output
+            if keep_order:
+                async for output in _collect_outputs_ordered():
+                    yield output
+            else:
+                async for output in _collect_outputs_unordered():
+                    yield output
 
     @override
     async def astream(
@@ -1894,40 +2442,306 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
             config,
             keep_order=keep_order,
             ignore_exceptions=ignore_exceptions,
-            run_type="astream",
+            run_type="parallel_astream",
             **kwargs,
         ):
             yield cast("PhotoType", result)
 
+    def _batch(
+        self,
+        input: Input,
+        receives: list[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        return_exceptions: bool = False,
+        **kwargs: Any | None,
+    ) -> Sequence[PhotoType | Exception]:
+        if receives is None:
+            raise ValueError(
+                "Parallel Transables require an input PhotoResult batch when batched."
+            )
+        if not receives:
+            return []
 
-FuncType = (
-    Callable[[Input], PhotoType]
-    | Callable[[Input], Transable[Input, PhotoType]]
-    | Callable[[Input], Iterator[PhotoType]]
-    | Callable[[Input, TransableConfig], PhotoType]
-    | Callable[[Input, TransableConfig], Iterator[PhotoType]]
-    | Callable[[Input, PhotoType], PhotoType]
-    | Callable[[Input, PhotoType, TransableConfig], PhotoType]
-)
-AsyncFuncType = (
-    Callable[[Input], Awaitable[PhotoType]]
-    | Callable[[Input], AsyncIterator[PhotoType]]
-    | Callable[[Input, TransableConfig], Awaitable[PhotoType]]
-    | Callable[[Input, TransableConfig], AsyncIterator[PhotoType]]
-    | Callable[[Input, PhotoType], Awaitable[PhotoType]]
-    | Callable[[Input, PhotoType, TransableConfig], Awaitable[PhotoType]]
-)
-TransableFuncType = (
-    Callable[[Input, Iterator[PhotoType]], Iterator[PhotoType]]
-    | Callable[[Input, Iterator[PhotoType]], AsyncIterator[PhotoType]]
-    | Callable[[Input, Iterator[PhotoType], TransableConfig], Iterator[PhotoType]]
-    | Callable[[Input, Iterator[PhotoType], TransableConfig], AsyncIterator[PhotoType]]
-    | Callable[[Input, AsyncIterator[PhotoType]], AsyncIterator[PhotoType]]
-    | Callable[
-        [Input, AsyncIterator[PhotoType], TransableConfig],
-        AsyncIterator[PhotoType],
-    ]
-)
+        base_items = [coerce_photo(item, self.PhotoType) for item in receives]
+        step_results: list[Sequence[PhotoType | Exception] | None] = [None] * len(
+            self.steps
+        )
+
+        def _run_step(idx: int, step: Transable[Input, PhotoType]) -> None:
+            child_config = patch_config(config, child=True)
+            step_inputs = [clone_photo(item) for item in base_items]
+            try:
+                results = run_in_context(
+                    child_config,
+                    step.batch,
+                    input,
+                    step_inputs,
+                    child_config,
+                    return_exceptions=True,
+                    **kwargs,
+                )
+            except Exception as exc:
+                if not return_exceptions:
+                    raise
+                step_results[idx] = [exc] * len(base_items)
+                return
+
+            coerced_results: list[PhotoType | Exception] = []
+            for res in results:
+                if isinstance(res, Exception):
+                    coerced_results.append(res)
+                else:
+                    coerced_results.append(coerce_photo(res, self.PhotoType))
+            step_results[idx] = coerced_results
+
+        executor_config = patch_config(config, max_concurrency=len(self.steps) + 1)
+        with get_executor_for_config(executor_config) as executor:
+            executor.map(_run_step, range(len(self.steps)), self.steps)
+
+        outputs: list[PhotoType | Exception] = []
+        for i, base_item in enumerate(base_items):
+            item_results = [
+                step_result[i] for step_result in step_results if step_result
+            ]
+            if excs := [res for res in item_results if isinstance(res, Exception)]:
+                exc = (
+                    ExceptionGroup(
+                        f"Errors occurred in parallel Transable steps for photo {i}: {base_item}.",
+                        excs,
+                    )
+                    if len(excs) > 1
+                    else excs[0]
+                )
+                outputs.append(exc)
+                continue
+            results = cast("list[PhotoType]", item_results)
+            outputs.append(merge_photos(base_item, results))
+
+        if (not return_exceptions) and (
+            excs := [res for res in outputs if isinstance(res, Exception)]
+        ):
+            raise (
+                ExceptionGroup(
+                    "Errors occurred in parallel Transable steps.",
+                    excs,
+                )
+                if len(excs) > 1
+                else excs[0]
+            )
+        return outputs
+
+    @overload
+    def batch(
+        self,
+        input: Input,
+        receives: list[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        return_exceptions: Literal[False],
+        **kwargs: Any | None,
+    ) -> Sequence[PhotoType]: ...
+
+    @overload
+    def batch(
+        self,
+        input: Input,
+        receives: list[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        return_exceptions: Literal[True],
+        **kwargs: Any | None,
+    ) -> Sequence[PhotoType | Exception]: ...
+
+    @override
+    def batch(
+        self,
+        input: Input,
+        receives: list[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        return_exceptions: bool = False,
+        **kwargs: Any | None,
+    ) -> Sequence[PhotoType | Exception]:
+        config = ensure_config(config)
+
+        return self._batch_with_config(
+            self._batch,
+            input,
+            receives,
+            config,
+            return_exceptions=return_exceptions,
+            run_type="parallel_batch",
+            **kwargs,
+        )
+
+    async def _abatch(
+        self,
+        input: Input,
+        receives: list[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        return_exceptions: bool = False,
+        **kwargs: Any | None,
+    ) -> Sequence[PhotoType | Exception]:
+        if receives is None:
+            raise ValueError(
+                "Parallel Transables require an input PhotoResult batch when batched."
+            )
+        if not receives:
+            return []
+
+        base_items = [coerce_photo(item, self.PhotoType) for item in receives]
+        step_results: list[Sequence[PhotoType | Exception] | None] = [None] * len(
+            self.steps
+        )
+
+        async def _run_step(idx: int, step: Transable[Input, PhotoType]) -> None:
+            child_config = patch_config(config, child=True)
+            step_inputs = [clone_photo(item) for item in base_items]
+            try:
+                results = await arun_in_context(
+                    child_config,
+                    step.abatch,
+                    input,
+                    step_inputs,
+                    child_config,
+                    return_exceptions=True,
+                    **kwargs,
+                )
+            except Exception as exc:
+                if not return_exceptions:
+                    raise
+                step_results[idx] = [exc] * len(base_items)
+                return
+
+            coerced_results: list[PhotoType | Exception] = []
+            for res in results:
+                if isinstance(res, Exception):
+                    coerced_results.append(res)
+                else:
+                    coerced_results.append(coerce_photo(res, self.PhotoType))
+            step_results[idx] = coerced_results
+
+        async with anyio.create_task_group() as tg:
+            for idx, step in enumerate(self.steps):
+                tg.start_soon(_run_step, idx, step)
+
+        outputs: list[PhotoType | Exception] = []
+        for i, base_item in enumerate(base_items):
+            item_results = [
+                step_result[i] for step_result in step_results if step_result
+            ]
+            if excs := [res for res in item_results if isinstance(res, Exception)]:
+                exc = (
+                    ExceptionGroup(
+                        f"Errors occurred in parallel Transable steps for photo {i}: {base_item}.",
+                        excs,
+                    )
+                    if len(excs) > 1
+                    else excs[0]
+                )
+                outputs.append(exc)
+                continue
+            results = cast("list[PhotoType]", item_results)
+            outputs.append(merge_photos(base_item, results))
+
+        if (not return_exceptions) and (
+            excs := [res for res in outputs if isinstance(res, Exception)]
+        ):
+            raise (
+                ExceptionGroup(
+                    "Errors occurred in parallel Transable steps.",
+                    excs,
+                )
+                if len(excs) > 1
+                else excs[0]
+            )
+        return outputs
+
+    @overload
+    async def abatch(
+        self,
+        input: Input,
+        receives: list[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        return_exceptions: Literal[False],
+        **kwargs: Any | None,
+    ) -> Sequence[PhotoType]: ...
+
+    @overload
+    async def abatch(
+        self,
+        input: Input,
+        receives: list[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        return_exceptions: Literal[True],
+        **kwargs: Any | None,
+    ) -> Sequence[PhotoType | Exception]: ...
+
+    @override
+    async def abatch(
+        self,
+        input: Input,
+        receives: list[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        return_exceptions: bool = False,
+        **kwargs: Any | None,
+    ) -> Sequence[PhotoType | Exception]:
+        config = ensure_config(config)
+
+        return await self._abatch_with_config(
+            self._abatch,
+            input,
+            receives,
+            config,
+            return_exceptions=return_exceptions,
+            run_type="parallel_abatch",
+            **kwargs,
+        )
+
+    @override
+    def __and__(
+        self,
+        other: Transable[Any, Any]
+        | Callable[[Any], Any]
+        | Callable[[Any], Awaitable[Any]]
+        | Callable[[Any, Iterator[Any]], Iterator[Any]]
+        | Callable[[Any, AsyncIterator[Any]], AsyncIterator[Any]],
+    ) -> TransableSerializable[Input, PhotoType]:
+        if isinstance(other, TransableParallel):
+            return TransableParallel(
+                *(self.steps + other.steps),
+                name=self.name or other.name,
+            )
+        return TransableParallel(
+            *self.steps,
+            coerce_to_transable(other),
+            name=self.name,
+        )
+
+    @override
+    def __rand__(
+        self,
+        other: Transable[Any, Any]
+        | Callable[[Any], Any]
+        | Callable[[Any], Awaitable[Any]]
+        | Callable[[Any, Iterator[Any]], Iterator[Any]]
+        | Callable[[Any, AsyncIterator[Any]], AsyncIterator[Any]],
+    ) -> TransableSerializable[Input, PhotoType]:
+        if isinstance(other, TransableParallel):
+            return TransableParallel(
+                *(other.steps + self.steps),
+                name=other.name or self.name,
+            )
+        return TransableParallel(
+            coerce_to_transable(other),
+            *self.steps,
+            name=self.name,
+        )
 
 
 # Incomplete revisions
@@ -1936,29 +2750,118 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
 
     def __init__(
         self,
-        func: FuncType | AsyncFuncType | TransableFuncType,
-        stream_func: TransableFuncType | None = None,
+        func: (
+            Callable[[Input], PhotoType]
+            | Callable[[Input], Transable[Input, PhotoType]]
+            | Callable[[Input, TransableConfig], PhotoType]
+            | Callable[[Input, PhotoType], PhotoType]
+            | Callable[[Input, PhotoType, TransableConfig], PhotoType]
+        )
+        | (
+            Callable[[Input], Awaitable[PhotoType]]
+            | Callable[[Input, TransableConfig], Awaitable[PhotoType]]
+            | Callable[[Input, PhotoType], Awaitable[PhotoType]]
+            | Callable[[Input, PhotoType, TransableConfig], Awaitable[PhotoType]]
+        )
+        | (
+            Callable[[Input, Iterator[PhotoType]], Iterator[PhotoType]]
+            | Callable[
+                [Input, Iterator[PhotoType], TransableConfig], Iterator[PhotoType]
+            ]
+            | Callable[[Input, AsyncIterator[PhotoType]], AsyncIterator[PhotoType]]
+            | Callable[
+                [Input, AsyncIterator[PhotoType], TransableConfig],
+                AsyncIterator[PhotoType],
+            ]
+        ),
+        afunc: (
+            Callable[[Input], Awaitable[PhotoType]]
+            | Callable[[Input, TransableConfig], Awaitable[PhotoType]]
+            | Callable[[Input, PhotoType], Awaitable[PhotoType]]
+            | Callable[[Input, PhotoType, TransableConfig], Awaitable[PhotoType]]
+        )
+        | None = None,
+        stream_func: (
+            Callable[[Input, Iterator[PhotoType]], Iterator[PhotoType]]
+            | Callable[
+                [Input, Iterator[PhotoType], TransableConfig], Iterator[PhotoType]
+            ]
+            | Callable[[Input, AsyncIterator[PhotoType]], AsyncIterator[PhotoType]]
+            | Callable[
+                [Input, AsyncIterator[PhotoType], TransableConfig],
+                AsyncIterator[PhotoType],
+            ]
+        )
+        | None = None,
+        astream_func: (
+            Callable[[Input, AsyncIterator[PhotoType]], AsyncIterator[PhotoType]]
+            | Callable[
+                [Input, AsyncIterator[PhotoType], TransableConfig],
+                AsyncIterator[PhotoType],
+            ]
+        )
+        | None = None,
         name: str | None = None,
     ) -> None:
         """"""
+        func_for_name = func
+
+        if afunc is not None:
+            if is_async_callable(func) or is_async_generator(func):
+                raise TypeError(
+                    "Func was provided as a coroutine function, but afunc was "
+                    "also provided. If providing both, func should be a regular "
+                    "function to avoid ambiguity."
+                )
+            self.afunc = afunc
+            func_for_name = afunc
+
         if stream_func is not None:
             self.stream_func = stream_func
             func_for_name = stream_func
 
-        if is_generator(func) or is_async_generator(func):
-            if stream_func is not None:
+        if astream_func is not None:
+            self.astream_func = astream_func
+            func_for_name = astream_func
+
+        if is_generator(func):
+            if stream_func is not None or astream_func is not None:
                 raise ValueError(
-                    "Func was provided along with stream_func, but func is async or a generator. "
-                    "Only one of func or stream_func should be provided in this case."
+                    "Func was provided along with stream_func or astream_func, but "
+                    "func is a generator. Only one of func, stream_func, or "
+                    "astream_func should be provided in this case."
                 )
             self.func = func
             self.stream_func = func
             func_for_name = func
-        elif is_async_callable(func) or callable(func):
+        elif is_async_generator(func):
+            if stream_func is not None or astream_func is not None:
+                raise ValueError(
+                    "Func was provided along with stream_func or astream_func, but "
+                    "func is an async generator. Only one of func, stream_func, or "
+                    "astream_func should be provided in this case."
+                )
+            self.func = func
+            self.astream_func = func
+            func_for_name = func
+        elif is_async_callable(func):
+            self.afunc = func
+            func_for_name = func
+        elif callable(func):
             self.func = func
             func_for_name = func
         else:
             raise TypeError("func must be a callable, generator, or async generator.")
+
+        if (
+            accepts_receives(func)
+            and not hasattr(self, "stream_func")
+            and not hasattr(self, "astream_func")
+        ):
+            if is_async_callable(func) or is_async_generator(func):
+                self.astream_func = func
+            else:
+                self.stream_func = func
 
         try:
             if name is not None:
@@ -1974,7 +2877,12 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
     @override
     def InputType(self) -> Any:
         """The type of the input to this Transable."""
-        func = getattr(self, "func", None) or self.stream_func
+        func = (
+            getattr(self, "func", None)
+            or getattr(self, "afunc", None)
+            or getattr(self, "stream_func", None)
+            or self.astream_func
+        )
         try:
             params = inspect.signature(func).parameters
             first_param = next(iter(params.values()), None)
@@ -1992,7 +2900,12 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         Returns:
             The type of the output of this Transable.
         """
-        func = getattr(self, "func", None) or self.stream_func
+        func = (
+            getattr(self, "func", None)
+            or getattr(self, "afunc", None)
+            or getattr(self, "stream_func", None)
+            or self.astream_func
+        )
         try:
             sig = inspect.signature(func)
             if sig.return_annotation != inspect.Signature.empty:
@@ -2019,7 +2932,12 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         Returns:
             The input schema for this Runnable.
         """
-        func = getattr(self, "func", None) or self.stream_func
+        func = (
+            getattr(self, "func", None)
+            or getattr(self, "afunc", None)
+            or getattr(self, "stream_func", None)
+            or self.astream_func
+        )
 
         if isinstance(func, itemgetter):
             # This is terrible, but afaict it's not possible to access _items
@@ -2057,14 +2975,165 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         if self._repr is None:
             if hasattr(self, "func"):
                 self._repr = f"TransableLambda({get_lambda_source(self.func) or '...'})"
+            elif hasattr(self, "afunc"):
+                self._repr = (
+                    f"TransableLambda(afunc={get_lambda_source(self.afunc) or '...'})"
+                )
             elif hasattr(self, "stream_func"):
                 self._repr = (
                     "TransableLambda(stream_func="
                     f"{get_lambda_source(self.stream_func) or '...'})"
                 )
+            elif hasattr(self, "astream_func"):
+                self._repr = (
+                    "TransableLambda(astream_func="
+                    f"{get_lambda_source(self.astream_func) or '...'})"
+                )
             else:
                 self._repr = "TransableLambda(...)"
         return self._repr
+
+    def _merge_results(
+        self,
+        receive: PhotoType | None,
+        results: list[PhotoType],
+    ) -> PhotoType:
+        if not results:
+            if receive is not None:
+                return coerce_photo(receive, self.PhotoType)
+            raise ValueError(
+                "TransableLambda generator produced no results and no prior receive value."
+            )
+        try:
+            base = (
+                coerce_photo(receive, self.PhotoType)
+                if receive is not None
+                else results[0]
+            )
+            return merge_photos(base, results)
+        except Exception:
+            return results[-1]
+
+    def _call_sync(
+        self,
+        input: Input,
+        receive: PhotoType | None,
+        config: TransableConfig,
+        **kwargs: Any,
+    ) -> Any:
+        if not hasattr(self, "func"):
+            raise TypeError(
+                "Cannot invoke a coroutine function synchronously. "
+                "Use `ainvoke` instead."
+            )
+        if is_async_callable(self.func) or is_async_generator(self.func):
+            raise TypeError(
+                "Cannot invoke a coroutine function synchronously. "
+                "Use `ainvoke` instead."
+            )
+        if accepts_receives(self.func) and not accepts_receive(self.func):
+            raise TypeError(
+                "Cannot invoke a function that expects receives. "
+                "Use `stream` or `astream` instead."
+            )
+
+        output = call_func_with_variable_args(
+            cast("Callable[[Input], Any]", self.func),
+            input,
+            receive,
+            config,
+            **kwargs,
+        )
+
+        if isinstance(output, AsyncIterator):
+            raise TypeError(
+                "Cannot invoke an async iterator synchronously. Use `ainvoke` instead."
+            )
+        if isinstance(output, Iterator):
+            results = [
+                coerce_photo(res, self.PhotoType) for res in output if res is not None
+            ]
+            return self._merge_results(receive, results)
+        return output
+
+    def _call_stream_func_sync(
+        self,
+        input: Input,
+        receives: Iterator[PhotoType] | None,
+        config: TransableConfig,
+        **kwargs: Any,
+    ) -> Any:
+        if not hasattr(self, "stream_func"):
+            raise TypeError("stream_func is not defined.")
+
+        config_for_call = ensure_config(config)
+        if config_for_call.get("callbacks") or config_for_call.get("trace"):
+            config_for_call = patch_config(config_for_call, child=True)
+
+        call_kwargs = dict(kwargs)
+        if accepts_config(self.stream_func):
+            call_kwargs["config"] = config_for_call
+        if accepts_receives(self.stream_func):
+            call_kwargs["receives"] = receives if receives is not None else iter(())
+        elif accepts_receive(self.stream_func):
+            if receives is not None:
+                raise TypeError(
+                    "stream_func expects a single receive value; use func instead."
+                )
+            call_kwargs["receive"] = None
+
+        return run_in_context(
+            config_for_call,
+            cast("Callable[..., Iterator[PhotoType]]", self.stream_func),
+            input,
+            **call_kwargs,
+        )
+
+    def _invoke(
+        self,
+        input: Input,
+        receive: PhotoType | None,
+        config: TransableConfig,
+        **kwargs: Any,
+    ) -> PhotoType:
+        output = self._call_sync(input, receive, config, **kwargs)
+        if isinstance(output, Transable):
+            recursion_limit = config["recursion_limit"]  # type: ignore
+            if recursion_limit <= 0:
+                raise RecursionError(
+                    f"Recursion limit reached when invoking {self} with input {input}."
+                )
+            child_config = patch_config(config, child=True)
+            output = output.invoke(
+                input,
+                receive,
+                patch_config(child_config, recursion_limit=recursion_limit - 1),
+                **kwargs,
+            )
+        return cast("PhotoType", output)
+
+    @override
+    def invoke(
+        self,
+        input: Input,
+        receive: PhotoType | None = None,
+        config: TransableConfig | None = None,
+        **kwargs: Any,
+    ) -> PhotoType:
+        config = ensure_config(config)
+        if hasattr(self, "func"):
+            return self._call_with_config(
+                self._invoke,
+                input,
+                receive,
+                config,
+                run_type="invoke",
+                **kwargs,
+            )
+
+        raise TypeError(
+            "Cannot invoke a coroutine function synchronously. Use `ainvoke` instead."
+        )
 
     async def _ainvoke(
         self,
@@ -2073,62 +3142,94 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         config: TransableConfig,
         **kwargs: Any,
     ) -> Any:
-        config = ensure_config(config)
-        if is_generator(self.func) or is_async_generator(self.func):
-            output: PhotoType | None = None
-            if is_generator(self.func):
-                results = list(
-                    call_func_with_variable_args(
-                        cast("Callable[[Input], Iterator[PhotoType]]", self.func),
-                        input,
-                        receive,
-                        config,
-                        **kwargs,
-                    )
-                )
-            else:
+        if hasattr(self, "afunc"):
+            if is_async_generator(self.afunc):
                 results = [
-                    res
+                    coerce_photo(res, self.PhotoType)
                     async for res in call_func_with_variable_args(
-                        cast("Callable[[Input], AsyncIterator[PhotoType]]", self.func),
+                        cast("Callable[[Input], AsyncIterator[PhotoType]]", self.afunc),
                         input,
                         receive,
                         config,
                         **kwargs,
                     )
+                    if res is not None
                 ]
+                output: Any = self._merge_results(receive, results)
+            else:
+                if accepts_receives(self.afunc) and not accepts_receive(self.afunc):
+                    raise TypeError(
+                        "Cannot invoke a function that expects receives. "
+                        "Use `stream` or `astream` instead."
+                    )
+                output = await acall_func_with_variable_args(
+                    cast("Callable[[Input], Awaitable[Any]]", self.afunc),
+                    input,
+                    receive,
+                    config,
+                    **kwargs,
+                )
+                if isinstance(output, AsyncIterator):
+                    results = [
+                        coerce_photo(res, self.PhotoType)
+                        async for res in output
+                        if res is not None
+                    ]
+                    output = self._merge_results(receive, results)
+                elif isinstance(output, Iterator):
+                    results = [
+                        coerce_photo(res, self.PhotoType)
+                        for res in output
+                        if res is not None
+                    ]
+                    output = self._merge_results(receive, results)
+        elif not hasattr(self, "func"):
+            raise TypeError(
+                "Cannot invoke a stream function asynchronously. Use `astream` instead."
+            )
+        elif is_async_generator(self.func):
             results = [
-                coerce_photo(res, self.PhotoType) for res in results if res is not None
+                coerce_photo(res, self.PhotoType)
+                async for res in call_func_with_variable_args(
+                    cast("Callable[[Input], AsyncIterator[PhotoType]]", self.func),
+                    input,
+                    receive,
+                    config,
+                    **kwargs,
+                )
+                if res is not None
             ]
-            if not results:
-                if receive is not None:
-                    return coerce_photo(receive, self.PhotoType)
-                raise ValueError(
-                    "TransableLambda generator produced no results and no prior receive value."
-                )
-            if len(results) == 1:
-                output = results[0]
-            try:
-                output = merge_photos(
-                    receive if receive is not None else results[0], results
-                )
-            except Exception:
-                output = results[-1]
+            output: Any = self._merge_results(receive, results)
         elif is_async_callable(self.func):
-            output = await call_func_with_variable_args(
-                cast("Callable[[Input], Awaitable[PhotoType]]", self.func),
+            if accepts_receives(self.func) and not accepts_receive(self.func):
+                raise TypeError(
+                    "Cannot invoke a function that expects receives. "
+                    "Use `stream` or `astream` instead."
+                )
+            output = await acall_func_with_variable_args(
+                cast("Callable[[Input], Awaitable[Any]]", self.func),
                 input,
                 receive,
                 config,
                 **kwargs,
             )
+            if isinstance(output, AsyncIterator):
+                results = [
+                    coerce_photo(res, self.PhotoType)
+                    async for res in output
+                    if res is not None
+                ]
+                output = self._merge_results(receive, results)
+            elif isinstance(output, Iterator):
+                results = [
+                    coerce_photo(res, self.PhotoType)
+                    for res in output
+                    if res is not None
+                ]
+                output = self._merge_results(receive, results)
         else:
-            output = call_func_with_variable_args(
-                cast("Callable[[Input], PhotoType]", self.func),
-                input,
-                receive,
-                config,
-                **kwargs,
+            output = await run_in_executor(
+                config, self._call_sync, input, receive, config, **kwargs
             )
 
         if isinstance(output, Transable):
@@ -2156,18 +3257,90 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         **kwargs: Any,
     ) -> PhotoType:
         config = ensure_config(config)
-        if hasattr(self, "func"):
+        if hasattr(self, "func") or hasattr(self, "afunc"):
             return await self._acall_with_config(
                 self._ainvoke,
                 input,
                 receive,
                 config,
-                "invoke",
+                run_type="ainvoke",
                 **kwargs,
             )
 
         raise TypeError(
-            "Cannot use invoke when only stream_func is defined.Please use stream instead."
+            "Cannot invoke a stream function asynchronously. Use `astream` instead."
+        )
+
+    def _stream(
+        self,
+        input: Input,
+        receives: Iterator[PhotoType] | None,
+        config: TransableConfig,
+        *,
+        keep_order: bool = False,
+        ignore_exceptions: bool = False,
+        **kwargs: Any,
+    ) -> Iterator[PhotoType]:
+        if not hasattr(self, "stream_func"):
+            if (
+                not hasattr(self, "func")
+                or is_async_callable(self.func)
+                or is_async_generator(self.func)
+            ):
+                raise TypeError(
+                    "Cannot stream an async function synchronously. "
+                    "Use `astream` instead."
+                )
+            yield from super().stream(
+                input,
+                receives,
+                config,
+                keep_order=keep_order,
+                ignore_exceptions=ignore_exceptions,
+                **kwargs,
+            )
+            return
+
+        if is_async_generator(self.stream_func) or is_async_callable(self.stream_func):
+            raise TypeError(
+                "Cannot stream an async function synchronously. Use `astream` instead."
+            )
+
+        stream_output = self._call_stream_func_sync(input, receives, config, **kwargs)
+        if isinstance(stream_output, AsyncIterator):
+            raise TypeError(
+                "Cannot stream an async iterator synchronously. Use `astream` instead."
+            )
+        if not isinstance(stream_output, Iterator):
+            raise TypeError("stream_func must return an iterator.")
+
+        for res in stream_output:
+            if res is None:
+                continue
+            yield coerce_photo(res, self.PhotoType)
+
+    @override
+    def stream(
+        self,
+        input: Input,
+        receives: Iterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: bool = False,
+        ignore_exceptions: bool = False,
+        **kwargs: Any,
+    ) -> Iterator[PhotoType]:
+        config = ensure_config(config)
+
+        yield from self._stream_with_config(
+            self._stream,
+            input,
+            receives,
+            config,
+            keep_order=keep_order,
+            ignore_exceptions=ignore_exceptions,
+            run_type="stream",
+            **kwargs,
         )
 
     async def _astream(
@@ -2175,34 +3348,98 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         input: Input,
         receives: AsyncIterator[PhotoType] | None,
         config: TransableConfig,
+        *,
+        keep_order: bool = False,
+        ignore_exceptions: bool = False,
         **kwargs: Any,
     ) -> AsyncIterator[PhotoType]:
-        if is_generator(self.stream_func):
-            for res in call_func_with_variable_args(
-                cast(
-                    "Callable[[Input, Iterator[PhotoType]], Iterator[PhotoType]]",
-                    self.stream_func,
-                ),
+        stream_func: Callable[..., Any] | None = None
+        if hasattr(self, "astream_func"):
+            stream_func = self.astream_func
+        elif hasattr(self, "stream_func"):
+            stream_func = self.stream_func
+
+        if stream_func is None:
+            async for item in super().astream(
                 input,
                 receives,
                 config,
+                keep_order=keep_order,
+                ignore_exceptions=ignore_exceptions,
                 **kwargs,
             ):
-                yield coerce_photo(res, self.PhotoType)
-        elif is_async_generator(self.stream_func):
+                yield item
+            return
+
+        if is_generator(stream_func):
+            raise TypeError(
+                "Cannot stream from a generator function asynchronously. "
+                "Use `stream` instead."
+            )
+
+        receives_for_call = receives
+        if receives_for_call is None:
+
+            async def _empty_stream() -> AsyncIterator[PhotoType]:
+                if False:
+                    yield None
+
+            receives_for_call = _empty_stream()
+
+        if is_async_generator(stream_func):
             async for res in call_func_with_variable_args(
                 cast(
                     "Callable[[Input, AsyncIterator[PhotoType]], AsyncIterator[PhotoType]]",
-                    self.stream_func,
+                    stream_func,
                 ),
                 input,
-                receives,
+                receives_for_call,
                 config,
                 **kwargs,
             ):
+                if res is None:
+                    continue
                 yield coerce_photo(res, self.PhotoType)
-        else:
-            raise TypeError("stream_func must be a generator or async generator.")
+            return
+
+        if is_async_callable(stream_func):
+            output = await acall_func_with_variable_args(
+                cast(
+                    "Callable[[Input, AsyncIterator[PhotoType]], Awaitable[Any]]",
+                    stream_func,
+                ),
+                input,
+                receives_for_call,
+                config,
+                **kwargs,
+            )
+            if isinstance(output, AsyncIterator):
+                async for res in output:
+                    if res is None:
+                        continue
+                    yield coerce_photo(res, self.PhotoType)
+                return
+            raise TypeError("stream_func must return an async iterator.")
+
+        output = call_func_with_variable_args(
+            cast(
+                "Callable[[Input, AsyncIterator[PhotoType]], AsyncIterator[PhotoType]]",
+                stream_func,
+            ),
+            input,
+            receives_for_call,
+            config,
+            **kwargs,
+        )
+        if isinstance(output, AsyncIterator):
+            async for res in output:
+                if res is None:
+                    continue
+                yield coerce_photo(res, self.PhotoType)
+            return
+        raise TypeError(
+            "Cannot stream a synchronous function asynchronously. Use `stream` instead."
+        )
 
     @override
     async def astream(
@@ -2217,30 +3454,29 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
     ) -> AsyncIterator[PhotoType]:
         config = ensure_config(config)
 
-        if hasattr(self, "stream_func"):
-            async for item in self._astream_with_config(
-                self._astream,
-                input,
-                receives,
-                config,
-                "stream",
-                **kwargs,
-            ):
-                yield item
-            return
-        if receives is None:
-            yield await self.ainvoke(input, None, config, **kwargs)
-            return
-        async for item in receives:
-            yield await self.ainvoke(input, item, config, **kwargs)
+        async for item in self._astream_with_config(
+            self._astream,
+            input,
+            receives,
+            config,
+            keep_order=keep_order,
+            ignore_exceptions=ignore_exceptions,
+            run_type="astream",
+            **kwargs,
+        ):
+            yield item
 
     @override
     def __eq__(self, other: object) -> bool:
         if isinstance(other, TransableLambda):
             if hasattr(self, "func") and hasattr(other, "func"):
                 return self.func == other.func
+            if hasattr(self, "afunc") and hasattr(other, "afunc"):
+                return self.afunc == other.afunc
             if hasattr(self, "stream_func") and hasattr(other, "stream_func"):
                 return self.stream_func == other.stream_func
+            if hasattr(self, "astream_func") and hasattr(other, "astream_func"):
+                return self.astream_func == other.astream_func
             return False
         return False
 
@@ -2692,7 +3928,7 @@ def coerce_to_transable(
     if isinstance(obj, Transable):
         return obj
     if is_async_generator(obj) or inspect.isgeneratorfunction(obj):
-        return TransableLambda(cast("TransableFuncType", obj))
+        return TransableLambda(obj)
     if callable(obj):
         return TransableLambda(cast("Callable[[Input], PhotoType]", obj))
     msg = (
