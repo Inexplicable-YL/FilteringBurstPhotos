@@ -69,7 +69,6 @@ from core.transables.utils import (
     Output,
     PhotoType,
     acall_func_with_variable_args,
-    accepts_config,
     accepts_receive,
     accepts_receives,
     call_func_with_variable_args,
@@ -2824,32 +2823,44 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
             self.afunc = afunc
             func_for_name = afunc
 
-        if stream_func is not None:
-            self.stream_func = stream_func
-            func_for_name = stream_func
-
         if astream_func is not None:
             self.astream_func = astream_func
             func_for_name = astream_func
 
+        if stream_func is not None:
+            if is_generator(stream_func):
+                self.stream_func = stream_func
+                func_for_name = stream_func
+            elif is_async_generator(stream_func):
+                if astream_func is not None:
+                    raise ValueError(
+                        "stream_func was provided as an async generator, but "
+                        "astream_func was also provided. Only one of stream_func, "
+                        "astream_func should be provided in this case."
+                    )
+                self.astream_func = stream_func
+                func_for_name = stream_func
+            else:
+                raise TypeError("stream_func must be a generator or async generator.")
+
         if is_generator(func):
-            if stream_func is not None or astream_func is not None:
+            if stream_func is not None:
                 raise ValueError(
-                    "Func was provided along with stream_func or astream_func, but "
-                    "func is a generator. Only one of func, stream_func, or "
-                    "astream_func should be provided in this case."
+                    "Func was provided along with stream_func, but "
+                    "func is a generator. Only one of func, "
+                    "stream_func should be provided in this case."
                 )
             self.func = func
             self.stream_func = func
             func_for_name = func
         elif is_async_generator(func):
-            if stream_func is not None or astream_func is not None:
+            if astream_func is not None:
                 raise ValueError(
-                    "Func was provided along with stream_func or astream_func, but "
-                    "func is an async generator. Only one of func, stream_func, or "
+                    "Func was provided along with astream_func, but "
+                    "func is an async generator. Only one of func, "
                     "astream_func should be provided in this case."
                 )
-            self.func = func
+            self.afunc = func
             self.astream_func = func
             func_for_name = func
         elif is_async_callable(func):
@@ -3043,45 +3054,32 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         except Exception:
             return results[-1]
 
-    def _call_sync(
+    def _invoke(
         self,
         input: Input,
         receive: PhotoType | None,
         config: TransableConfig,
         **kwargs: Any,
-    ) -> Any:
-        if not hasattr(self, "func"):
-            raise TypeError(
-                "Cannot invoke a coroutine function synchronously. "
-                "Use `ainvoke` instead."
+    ) -> PhotoType:
+        if inspect.isgeneratorfunction(self.func):
+            receives_iter: Iterator[PhotoType] = (
+                iter((coerce_photo(receive, self.PhotoType),)) if receive else iter([])
             )
-        if is_async_callable(self.func) or is_async_generator(self.func):
-            raise TypeError(
-                "Cannot invoke a coroutine function synchronously. "
-                "Use `ainvoke` instead."
-            )
-        if accepts_receives(self.func) and not accepts_receive(self.func):
-            receives_iter: Iterator[PhotoType]
-            if receive is None:
-                receives_iter = iter(())
-            else:
-                receives_iter = iter((coerce_photo(receive, self.PhotoType),))
-
-            config_for_call = ensure_config(config)
-            if config_for_call.get("callbacks") or config_for_call.get("trace"):
-                config_for_call = patch_config(config_for_call, child=True)
-
-            call_kwargs = dict(kwargs)
-            if accepts_config(self.func):
-                call_kwargs["config"] = config_for_call
-            call_kwargs["receives"] = receives_iter
-
-            output = run_in_context(
-                config_for_call,
-                cast("Callable[..., Iterator[PhotoType]]", self.func),
+            output: PhotoType | None = None
+            for chunk in call_func_with_variable_args(
+                cast("Callable[[Input], Iterator[PhotoType]]", self.func),
                 input,
-                **call_kwargs,
-            )
+                receives_iter,
+                config,
+                **kwargs,
+            ):
+                if output is None:
+                    output = chunk
+                else:
+                    try:
+                        output = merge_photos(receive or output, [output, chunk])
+                    except (ValueError, TypeError):
+                        output = chunk
         else:
             output = call_func_with_variable_args(
                 cast("Callable[[Input], Any]", self.func),
@@ -3090,59 +3088,6 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
                 config,
                 **kwargs,
             )
-
-        if isinstance(output, AsyncIterator):
-            raise TypeError(
-                "Cannot invoke an async iterator synchronously. Use `ainvoke` instead."
-            )
-        if isinstance(output, Iterator):
-            results = [
-                coerce_photo(res, self.PhotoType) for res in output if res is not None
-            ]
-            return self._merge_results(receive, results)
-        return output
-
-    def _call_stream_func_sync(
-        self,
-        input: Input,
-        receives: Iterator[PhotoType] | None,
-        config: TransableConfig,
-        **kwargs: Any,
-    ) -> Any:
-        if not hasattr(self, "stream_func"):
-            raise TypeError("stream_func is not defined.")
-
-        config_for_call = ensure_config(config)
-        if config_for_call.get("callbacks") or config_for_call.get("trace"):
-            config_for_call = patch_config(config_for_call, child=True)
-
-        call_kwargs = dict(kwargs)
-        if accepts_config(self.stream_func):
-            call_kwargs["config"] = config_for_call
-        if accepts_receives(self.stream_func):
-            call_kwargs["receives"] = receives if receives is not None else iter(())
-        elif accepts_receive(self.stream_func):
-            if receives is not None:
-                raise TypeError(
-                    "stream_func expects a single receive value; use func instead."
-                )
-            call_kwargs["receive"] = None
-
-        return run_in_context(
-            config_for_call,
-            cast("Callable[..., Iterator[PhotoType]]", self.stream_func),
-            input,
-            **call_kwargs,
-        )
-
-    def _invoke(
-        self,
-        input: Input,
-        receive: PhotoType | None,
-        config: TransableConfig,
-        **kwargs: Any,
-    ) -> PhotoType:
-        output = self._call_sync(input, receive, config, **kwargs)
         if isinstance(output, Transable):
             recursion_limit = config["recursion_limit"]  # type: ignore
             if recursion_limit <= 0:
@@ -3156,6 +3101,33 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
                 patch_config(child_config, recursion_limit=recursion_limit - 1),
                 **kwargs,
             )
+        if isinstance(output, AsyncIterator):
+            raise TypeError(
+                "Cannot invoke an async iterator synchronously. Use `ainvoke` instead."
+            )
+        if isinstance(output, Iterator):
+            results = [
+                coerce_photo(res, self.PhotoType)
+                for res in cast("Iterator[Any]", output)
+                if res is not None
+            ]
+            if not results:
+                raise ValueError(
+                    "TransableLambda generator produced no results and no prior receive value."
+                )
+            if receive is not None:
+                output = merge_photos(receive, results)
+            else:
+                _output: PhotoType | None = None
+                for res in results:
+                    if _output is None:
+                        _output = res
+                    else:
+                        try:
+                            _output = merge_photos(_output, [_output, res])
+                        except (ValueError, TypeError):
+                            _output = res
+                output = _output
         return cast("PhotoType", output)
 
     @override
@@ -3176,7 +3148,6 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
                 run_type="invoke",
                 **kwargs,
             )
-
         raise TypeError(
             "Cannot invoke a coroutine function synchronously. Use `ainvoke` instead."
         )
@@ -3187,111 +3158,45 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         receive: PhotoType | None,
         config: TransableConfig,
         **kwargs: Any,
-    ) -> Any:
-        async def _single_receives() -> AsyncIterator[PhotoType]:
-            if receive is not None:
-                yield coerce_photo(receive, self.PhotoType)
-
-        all_receive: PhotoType | AsyncIterator[PhotoType] | None = receive
+    ) -> PhotoType:
         if hasattr(self, "afunc"):
-            if accepts_receives(self.afunc) and not accepts_receive(self.afunc):
-                all_receive = _single_receives()
-            if is_async_generator(self.afunc):
-                results = [
-                    coerce_photo(res, self.PhotoType)
-                    async for res in call_func_with_variable_args(
-                        cast("Callable[[Input], AsyncIterator[PhotoType]]", self.afunc),
-                        input,
-                        all_receive,
-                        config,
-                        **kwargs,
-                    )
-                    if res is not None
-                ]
-                output: Any = self._merge_results(receive, results)
-            else:
-                if is_async_callable(self.afunc):
-                    output = await acall_func_with_variable_args(
-                        cast("Callable[[Input], Awaitable[Any]]", self.afunc),
-                        input,
-                        all_receive,
-                        config,
-                        **kwargs,
-                    )
-                else:
-                    output = await run_in_executor(
-                        config,
-                        call_func_with_variable_args,
-                        cast("Callable[[Input], Any]", self.afunc),
-                        input,
-                        all_receive,
-                        config,
-                        **kwargs,
-                    )
-                if inspect.isawaitable(output):
-                    output = await cast("Awaitable[Any]", output)
-                if isinstance(output, AsyncIterator):
-                    results = [
-                        coerce_photo(res, self.PhotoType)
-                        async for res in output
-                        if res is not None
-                    ]
-                    output = self._merge_results(receive, results)
-                elif isinstance(output, Iterator):
-                    results = [
-                        coerce_photo(res, self.PhotoType)
-                        for res in output
-                        if res is not None
-                    ]
-                    output = self._merge_results(receive, results)
-        elif not hasattr(self, "func"):
-            raise TypeError(
-                "Cannot invoke a stream function asynchronously. Use `astream` instead."
-            )
-        elif is_async_generator(self.func):
-            if accepts_receives(self.func) and not accepts_receive(self.func):
-                all_receive = _single_receives()
-            results = [
-                coerce_photo(res, self.PhotoType)
-                async for res in call_func_with_variable_args(
-                    cast("Callable[[Input], AsyncIterator[PhotoType]]", self.func),
-                    input,
-                    all_receive,
-                    config,
-                    **kwargs,
-                )
-                if res is not None
-            ]
-            output: Any = self._merge_results(receive, results)
-        elif is_async_callable(self.func):
-            if accepts_receives(self.func) and not accepts_receive(self.func):
-                all_receive = _single_receives()
-            output = await acall_func_with_variable_args(
-                cast("Callable[[Input], Awaitable[Any]]", self.func),
+            afunc = self.afunc
+        else:
+
+            @wraps(self._invoke)
+            async def f(*args: Any, **kwargs: Any) -> Any:
+                return await run_in_executor(config, self._invoke, *args, **kwargs)
+
+            afunc = f
+        if inspect.isasyncgenfunction(afunc):
+
+            async def _receives_iter() -> AsyncIterator[PhotoType]:
+                if receive is not None:
+                    yield coerce_photo(receive, self.PhotoType)
+
+            output: PhotoType | None = None
+            async for chunk in call_func_with_variable_args(
+                cast("Callable[[Input], AsyncIterator[PhotoType]]", afunc),
                 input,
-                all_receive,
+                _receives_iter(),
+                config,
+                **kwargs,
+            ):
+                if output is None:
+                    output = chunk
+                else:
+                    try:
+                        output = merge_photos(receive or output, [output, chunk])
+                    except (ValueError, TypeError):
+                        output = chunk
+        else:
+            output = await acall_func_with_variable_args(
+                cast("Callable[[Input], Awaitable[Any]]", afunc),
+                input,
+                receive,
                 config,
                 **kwargs,
             )
-            if isinstance(output, AsyncIterator):
-                results = [
-                    coerce_photo(res, self.PhotoType)
-                    async for res in output
-                    if res is not None
-                ]
-                output = self._merge_results(receive, results)
-            elif isinstance(output, Iterator):
-                results = [
-                    coerce_photo(res, self.PhotoType)
-                    for res in output
-                    if res is not None
-                ]
-                output = self._merge_results(receive, results)
-        else:
-            output = await run_in_executor(
-                config, self._call_sync, input, receive, config, **kwargs
-            )
-
         if isinstance(output, Transable):
             recursion_limit = config["recursion_limit"]  # type: ignore
             if recursion_limit <= 0:
@@ -3305,7 +3210,37 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
                 patch_config(child_config, recursion_limit=recursion_limit - 1),
                 **kwargs,
             )
-
+        results: list[PhotoType] | None = None
+        if isinstance(output, AsyncIterator):
+            results = [
+                coerce_photo(res, self.PhotoType)
+                async for res in cast("AsyncIterator[Any]", output)
+                if res is not None
+            ]
+        elif isinstance(output, Iterator):
+            results = [
+                coerce_photo(res, self.PhotoType)
+                for res in cast("Iterator[Any]", output)
+                if res is not None
+            ]
+        if results is not None:
+            if not results:
+                raise ValueError(
+                    "TransableLambda generator produced no results and no prior receive value."
+                )
+            if receive is not None:
+                output = merge_photos(receive, results)
+            else:
+                _output: PhotoType | None = None
+                for res in results:
+                    if _output is None:
+                        _output = res
+                    else:
+                        try:
+                            _output = merge_photos(_output, [_output, res])
+                        except (ValueError, TypeError):
+                            _output = res
+                output = _output
         return cast("PhotoType", output)
 
     @override
@@ -3317,18 +3252,13 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         **kwargs: Any,
     ) -> PhotoType:
         config = ensure_config(config)
-        if hasattr(self, "func") or hasattr(self, "afunc"):
-            return await self._acall_with_config(
-                self._ainvoke,
-                input,
-                receive,
-                config,
-                run_type="ainvoke",
-                **kwargs,
-            )
-
-        raise TypeError(
-            "Cannot invoke a stream function asynchronously. Use `astream` instead."
+        return await self._acall_with_config(
+            self._ainvoke,
+            input,
+            receive,
+            config,
+            run_type="ainvoke",
+            **kwargs,
         )
 
     def _stream(
@@ -3342,56 +3272,40 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         **kwargs: Any,
     ) -> Iterator[PhotoType]:
         if not hasattr(self, "stream_func"):
-            if (
-                not hasattr(self, "func")
-                or is_async_callable(self.func)
-                or is_async_generator(self.func)
-            ):
-                raise TypeError(
-                    "Cannot stream an async function synchronously. "
-                    "Use `astream` instead."
-                )
+            child_config = patch_config(config, child=True)
             yield from super().stream(
                 input,
                 receives,
-                config,
+                child_config,
                 keep_order=keep_order,
                 ignore_exceptions=ignore_exceptions,
                 **kwargs,
             )
             return
 
-        if is_async_generator(self.stream_func) or is_async_callable(self.stream_func):
-            if (
-                hasattr(self, "func")
-                and not is_async_callable(self.func)
-                and not is_async_generator(self.func)
-            ):
-                yield from super().stream(
-                    input,
-                    receives,
-                    config,
-                    keep_order=keep_order,
-                    ignore_exceptions=ignore_exceptions,
-                    **kwargs,
+        receives_iter: Iterator[PhotoType] = receives or iter([])
+
+        if is_generator(self.stream_func):
+            stream_output = call_func_with_variable_args(
+                self.stream_func,
+                input,
+                receives_iter,
+                config,
+                **kwargs,
+            )
+            if isinstance(stream_output, AsyncIterator):
+                raise TypeError(
+                    "Cannot stream an async iterator synchronously. Use `astream` instead."
                 )
-                return
-            raise TypeError(
-                "Cannot stream an async function synchronously. Use `astream` instead."
-            )
+            if not isinstance(stream_output, Iterator):
+                raise TypeError("stream_func must return an iterator.")
 
-        stream_output = self._call_stream_func_sync(input, receives, config, **kwargs)
-        if isinstance(stream_output, AsyncIterator):
-            raise TypeError(
-                "Cannot stream an async iterator synchronously. Use `astream` instead."
-            )
-        if not isinstance(stream_output, Iterator):
-            raise TypeError("stream_func must return an iterator.")
-
-        for res in stream_output:
-            if res is None:
-                continue
-            yield coerce_photo(res, self.PhotoType)
+            for res in stream_output:
+                if res is None:
+                    continue
+                yield coerce_photo(res, self.PhotoType)
+        else:
+            raise TypeError("stream_func must be a generator.")
 
     @override
     def stream(
@@ -3434,10 +3348,11 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
             stream_func = self.stream_func
 
         if stream_func is None:
+            child_config = patch_config(config, child=True)
             async for item in super().astream(
                 input,
                 receives,
-                config,
+                child_config,
                 keep_order=keep_order,
                 ignore_exceptions=ignore_exceptions,
                 **kwargs,
@@ -3445,20 +3360,11 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
                 yield item
             return
 
-        if is_generator(stream_func):
-            raise TypeError(
-                "Cannot stream from a generator function asynchronously. "
-                "Use `stream` instead."
-            )
+        async def _empty_stream() -> AsyncIterator[PhotoType]:
+            if False:
+                yield None
 
-        receives_for_call = receives
-        if receives_for_call is None:
-
-            async def _empty_stream() -> AsyncIterator[PhotoType]:
-                if False:
-                    yield None
-
-            receives_for_call = _empty_stream()
+        receives_for_call: AsyncIterator[PhotoType] = receives or _empty_stream()
 
         if is_async_generator(stream_func):
             async for res in call_func_with_variable_args(
@@ -3474,9 +3380,7 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
                 if res is None:
                     continue
                 yield coerce_photo(res, self.PhotoType)
-            return
-
-        if is_async_callable(stream_func):
+        elif is_async_callable(stream_func):
             output = await acall_func_with_variable_args(
                 cast(
                     "Callable[[Input, AsyncIterator[PhotoType]], Awaitable[Any]]",
@@ -3492,76 +3396,80 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
                     if res is None:
                         continue
                     yield coerce_photo(res, self.PhotoType)
-                return
-            raise TypeError("stream_func must return an async iterator.")
+            else:
+                raise TypeError("stream_func must return an async iterator.")
+        else:
+            recv_queue: queue.Queue[tuple[str, PhotoType] | tuple[str, object]] = (
+                queue.Queue()
+            )
+            out_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+            recv_sentinel = object()
 
-        recv_queue: queue.Queue[tuple[str, PhotoType] | tuple[str, object]] = (
-            queue.Queue()
-        )
-        out_queue: queue.Queue[tuple[str, object]] = queue.Queue()
-        recv_sentinel = object()
+            def _iter_receives() -> Iterator[PhotoType]:
+                while True:
+                    kind, payload = recv_queue.get()
+                    if kind == "done":
+                        break
+                    yield cast("PhotoType", payload)
 
-        def _iter_receives() -> Iterator[PhotoType]:
-            while True:
-                kind, payload = recv_queue.get()
-                if kind == "done":
-                    break
-                yield cast("PhotoType", payload)
-
-        def _run_stream() -> None:
-            try:
-                stream_iter = self._call_stream_func_sync(
-                    input,
-                    _iter_receives(),
-                    config,
-                    **kwargs,
-                )
-                if isinstance(stream_iter, AsyncIterator):
-                    out_queue.put(
-                        (
-                            "error",
-                            TypeError(
-                                "Cannot stream an async iterator synchronously. "
-                                "Use `astream` instead."
-                            ),
+            def _run_stream() -> None:
+                try:
+                    stream_iter = call_func_with_variable_args(
+                        cast(
+                            "Callable[[Input, Iterator[PhotoType]], Iterator[PhotoType]]",
+                            stream_func,
+                        ),
+                        input,
+                        _iter_receives(),
+                        config,
+                        **kwargs,
+                    )
+                    if isinstance(stream_iter, AsyncIterator):
+                        out_queue.put(
+                            (
+                                "error",
+                                TypeError(
+                                    "Cannot stream an async iterator synchronously. "
+                                    "Use `astream` instead."
+                                ),
+                            )
                         )
-                    )
-                    return
-                if not isinstance(stream_iter, Iterator):
-                    out_queue.put(
-                        ("error", TypeError("stream_func must return an iterator."))
-                    )
-                    return
-                for res in stream_iter:
-                    out_queue.put(("item", res))
-            except Exception as exc:
-                out_queue.put(("error", exc))
-            finally:
-                out_queue.put(("done", None))
+                        return
+                    if not isinstance(stream_iter, Iterator):
+                        out_queue.put(
+                            ("error", TypeError("stream_func must return an iterator."))
+                        )
+                        return
+                    for res in stream_iter:
+                        out_queue.put(("item", res))
+                except Exception as exc:
+                    out_queue.put(("error", exc))
+                finally:
+                    out_queue.put(("done", None))
 
-        ctx = copy_context()
-        thread = threading.Thread(target=lambda: ctx.run(_run_stream), daemon=True)
-        thread.start()
+            ctx = copy_context()
+            thread = threading.Thread(target=lambda: ctx.run(_run_stream), daemon=True)
+            thread.start()
 
-        async def _feed_receives() -> None:
-            try:
-                if receives_for_call is not None:
-                    async for item in receives_for_call:
-                        recv_queue.put(("item", item))
-            finally:
-                recv_queue.put(("done", recv_sentinel))
+            async def _feed_receives() -> None:
+                try:
+                    if receives_for_call is not None:
+                        async for item in receives_for_call:
+                            recv_queue.put(("item", item))
+                finally:
+                    recv_queue.put(("done", recv_sentinel))
 
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(_feed_receives)
-            while True:
-                kind, payload = await run_in_executor(config, out_queue.get)
-                if kind == "done":
-                    return
-                if kind == "error":
-                    raise cast("Exception", payload)
-                if payload is None:
-                    continue
-                yield coerce_photo(cast("PhotoType", payload), self.PhotoType)
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_feed_receives)
+                while True:
+                    kind, payload = await run_in_executor(config, out_queue.get)
+                    if kind == "done":
+                        return
+                    if kind == "error":
+                        raise cast("Exception", payload)
+                    if payload is None:
+                        continue
+                    yield coerce_photo(cast("PhotoType", payload), self.PhotoType)
 
     @override
     async def astream(
