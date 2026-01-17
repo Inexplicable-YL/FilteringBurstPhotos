@@ -3014,45 +3014,19 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
     def __repr__(self) -> str:
         if self._repr is None:
             if hasattr(self, "func"):
-                self._repr = f"TransableLambda({get_lambda_source(self.func) or '...'})"
-            elif hasattr(self, "afunc"):
-                self._repr = (
-                    f"TransableLambda(afunc={get_lambda_source(self.afunc) or '...'})"
-                )
-            elif hasattr(self, "stream_func"):
-                self._repr = (
-                    "TransableLambda(stream_func="
-                    f"{get_lambda_source(self.stream_func) or '...'})"
-                )
-            elif hasattr(self, "astream_func"):
-                self._repr = (
-                    "TransableLambda(astream_func="
-                    f"{get_lambda_source(self.astream_func) or '...'})"
-                )
+                self._repr = f"TransableLambda({get_lambda_source(self.func) or '...'}"
+                if hasattr(self, "afunc"):
+                    self._repr += f", afunc={get_lambda_source(self.afunc) or '...'}"
+                if hasattr(self, "stream_func"):
+                    self._repr += (
+                        f", stream_func={get_lambda_source(self.stream_func) or '...'}"
+                    )
+                if hasattr(self, "astream_func"):
+                    self._repr += f", astream_func={get_lambda_source(self.astream_func) or '...'}"
+                self._repr += ")"
             else:
                 self._repr = "TransableLambda(...)"
         return self._repr
-
-    def _merge_results(
-        self,
-        receive: PhotoType | None,
-        results: list[PhotoType],
-    ) -> PhotoType:
-        if not results:
-            if receive is not None:
-                return coerce_photo(receive, self.PhotoType)
-            raise ValueError(
-                "TransableLambda generator produced no results and no prior receive value."
-            )
-        try:
-            base = (
-                coerce_photo(receive, self.PhotoType)
-                if receive is not None
-                else results[0]
-            )
-            return merge_photos(base, results)
-        except Exception:
-            return results[-1]
 
     def _invoke(
         self,
@@ -3272,7 +3246,7 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         **kwargs: Any,
     ) -> Iterator[PhotoType]:
         if not hasattr(self, "stream_func"):
-            child_config = patch_config(config, child=True)
+            child_config = patch_config(config, trace=False, child=True)
             yield from super().stream(
                 input,
                 receives,
@@ -3348,7 +3322,7 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
             stream_func = self.stream_func
 
         if stream_func is None:
-            child_config = patch_config(config, child=True)
+            child_config = patch_config(config, trace=False, child=True)
             async for item in super().astream(
                 input,
                 receives,
