@@ -33,7 +33,7 @@ from typing_extensions import override
 
 import anyio
 from anyio import BrokenResourceError, ClosedResourceError
-from pydantic import BaseModel, ConfigDict, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, RootModel, create_model
 
 from core.transables.config import (
     TransableConfig,
@@ -214,7 +214,7 @@ class Transable(ABC, Generic[Input, PhotoType]):
 
         return create_model(
             self.get_name("Input"),
-            root=root_type,
+            __base__=RootModel[root_type],
             # create model needs access to appropriate type annotations to be
             # able to construct the pydantic model.
             # When we create the model, we pass information about the namespace
@@ -222,7 +222,7 @@ class Transable(ABC, Generic[Input, PhotoType]):
             # be resolved correctly as well.
             # self.__class__.__module__ handles the case when the Runnable is
             # being sub-classed in a different module.
-            module_name=self.__class__.__module__,
+            __module__=self.__class__.__module__,
         )
 
     def get_input_jsonschema(
@@ -1755,7 +1755,14 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
             # This is correct, but pydantic typings/mypy don't think so.
             return create_model(
                 self.get_name("Input"),
-                field_definitions={
+                __config__=None,
+                __doc__=None,
+                __base__=None,
+                __module__=self.__class__.__module__,
+                __validators__=None,
+                __cls_kwargs__=None,
+                __qualname__=None,
+                **{
                     k: (v.annotation, v.default)
                     for step in self.steps
                     for k, v in step.get_input_schema(config).model_fields.items()
@@ -2988,15 +2995,25 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
             ):
                 fields = {item[1:-1]: (Any, ...) for item in items}
                 # It's a dict, lol
-                return create_model(self.get_name("Input"), field_definitions=fields)
-            module = getattr(func, "__module__", None)
+                return create_model(
+                    self.get_name("Input"),
+                    __config__=None,
+                    __doc__=None,
+                    __base__=None,
+                    __module__=self.__class__.__module__,
+                    __validators__=None,
+                    __cls_kwargs__=None,
+                    __qualname__=None,
+                    **fields,
+                )
+            module = getattr(func, "__module__", self.__class__.__module__)
             return create_model(
                 self.get_name("Input"),
-                root=list[Any],
+                __base__=RootModel[list[Any]],
                 # To create the schema, we need to provide the module
                 # where the underlying function is defined.
                 # This allows pydantic to resolve type annotations appropriately.
-                module_name=module,
+                __module__=module,
             )
 
         if self.InputType != Any:
@@ -3005,7 +3022,14 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         if dict_keys := get_function_first_arg_dict_keys(func):
             return create_model(
                 self.get_name("Input"),
-                field_definitions=dict.fromkeys(dict_keys, (Any, ...)),
+                __config__=None,
+                __doc__=None,
+                __base__=None,
+                __module__=self.__class__.__module__,
+                __validators__=None,
+                __cls_kwargs__=None,
+                __qualname__=None,
+                **dict.fromkeys(dict_keys, (Any, ...)),
             )
 
         return super().get_input_schema(config)
