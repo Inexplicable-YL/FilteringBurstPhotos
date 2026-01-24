@@ -330,6 +330,7 @@ class Transable(ABC, Generic[Input, PhotoType]):
             config, self.invoke, input, receive, config, **kwargs
         )
 
+    @overload
     def stream(
         self,
         input: Input,
@@ -337,10 +338,36 @@ class Transable(ABC, Generic[Input, PhotoType]):
         config: TransableConfig | None = None,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: Literal[False] = False,
         **kwargs: Any,
-    ) -> Iterator[PhotoType]:
+    ) -> Iterator[PhotoType]: ...
+
+    @overload
+    def stream(
+        self,
+        input: Input,
+        receives: Iterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: Literal[True],
+        return_exceptions: Literal[True],
+        **kwargs: Any,
+    ) -> Iterator[PhotoType | Exception]: ...
+
+    def stream(
+        self,
+        input: Input,
+        receives: Iterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: bool = False,
+        return_exceptions: bool = False,
+        **kwargs: Any,
+    ) -> Iterator[PhotoType | Exception]:
         """Consume a stream of inputs and yield streaming results."""
+        if (not keep_order) and return_exceptions:
+            raise ValueError("return_exceptions=True requires keep_order=True.")
+
         config = ensure_config(config)
 
         if receives is None:
@@ -355,84 +382,82 @@ class Transable(ABC, Generic[Input, PhotoType]):
                     **kwargs,
                 )
             except Exception as e:
-                if not ignore_exceptions:
+                if not return_exceptions:
                     raise
-                raise ValueError(
-                    "Exceptions cannot be ignored when only one output can be generated."
-                ) from e
+                yield e
             return
 
         max_concurrency = config.get("max_concurrency")
         max_in_flight = int(max_concurrency) if max_concurrency else None
 
-        def _run_one(item: PhotoType) -> PhotoType:
+        def _run_one(item: PhotoType) -> PhotoType | Exception:
             child_config = patch_config(config, child=True)
-            return run_in_context(
-                child_config,
-                self.invoke,
-                input,
-                item,
-                child_config,
-                **kwargs,
-            )
+            try:
+                return run_in_context(
+                    child_config,
+                    self.invoke,
+                    input,
+                    item,
+                    child_config,
+                    **kwargs,
+                )
+            except Exception as e:
+                if not return_exceptions:
+                    raise
+                return e
+
+        in_flight: set[Future[PhotoType | Exception]] = set()
+        idx_by_future: dict[Future[PhotoType | Exception], int] = {}
+        pending_results: dict[int, PhotoType | Exception] = {}
+        next_idx = 0
+
+        def _collect_done(done: set[Future[PhotoType | Exception]]) -> None:
+            for fut in done:
+                i = idx_by_future.pop(fut)
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    if not return_exceptions:
+                        for pf in in_flight:
+                            pf.cancel()
+                        raise
+                    pending_results[i] = e
+                else:
+                    pending_results[i] = res
+
+        def _yield_ready_in_order() -> Iterator[PhotoType | Exception]:
+            nonlocal next_idx
+            while next_idx in pending_results:
+                out = pending_results.pop(next_idx)
+                next_idx += 1
+                yield out
+
+        def _yield_done_unordered(
+            done: set[Future[PhotoType | Exception]],
+        ) -> Iterator[PhotoType]:
+            for fut in done:
+                idx_by_future.pop(fut, None)
+                try:
+                    out = fut.result()
+                except Exception:
+                    for pf in in_flight:
+                        pf.cancel()
+                    raise
+                yield cast("PhotoType", out)
 
         with get_executor_for_config(config) as executor:
-            in_flight: set[Future[PhotoType]] = set()
-            idx_by_future: dict[Future[PhotoType], int] = {}
-            pending_results: dict[int, PhotoType | None] = {}
-            next_idx = 0
-
-            def _collect_done(done: set[Future[PhotoType]]) -> None:
-                nonlocal next_idx
-                for fut in done:
-                    i = idx_by_future.pop(fut)
-                    try:
-                        res = fut.result()
-                    except Exception:
-                        if not ignore_exceptions:
-                            for pf in in_flight:
-                                pf.cancel()
-                            raise
-                        pending_results[i] = None
-                    else:
-                        pending_results[i] = res
-
-            def _yield_ready_in_order() -> Iterator[PhotoType]:
-                nonlocal next_idx
-                while next_idx in pending_results:
-                    out = pending_results.pop(next_idx)
-                    next_idx += 1
-                    if out is not None:
-                        yield out
-
-            def _yield_done_unordered(
-                done: set[Future[PhotoType]],
-            ) -> Iterator[PhotoType]:
-                for fut in done:
-                    idx_by_future.pop(fut, None)
-                    try:
-                        out = fut.result()
-                    except Exception:
-                        if not ignore_exceptions:
-                            for pf in in_flight:
-                                pf.cancel()
-                            raise
-                        continue
-                    else:
-                        if out is not None:
-                            yield out
-
             for idx, item in enumerate(receives):
                 if max_in_flight is not None:
                     while len(in_flight) >= max_in_flight:
                         done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+
                         if keep_order:
                             _collect_done(done)
                             yield from _yield_ready_in_order()
                         else:
                             yield from _yield_done_unordered(done)
 
-                fut = cast("Future[PhotoType]", executor.submit(_run_one, item))
+                fut = executor.submit(_run_one, item)
                 in_flight.add(fut)
                 idx_by_future[fut] = idx
 
@@ -444,6 +469,30 @@ class Transable(ABC, Generic[Input, PhotoType]):
                 else:
                     yield from _yield_done_unordered(done)
 
+    @overload
+    def astream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: bool = False,
+        return_exceptions: Literal[False] = False,
+        **kwargs: Any,
+    ) -> AsyncIterator[PhotoType]: ...
+
+    @overload
+    def astream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: Literal[True],
+        return_exceptions: Literal[True],
+        **kwargs: Any,
+    ) -> AsyncIterator[PhotoType | Exception]: ...
+
     async def astream(
         self,
         input: Input,
@@ -451,10 +500,13 @@ class Transable(ABC, Generic[Input, PhotoType]):
         config: TransableConfig | None = None,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
-    ) -> AsyncIterator[PhotoType]:
+    ) -> AsyncIterator[PhotoType | Exception]:
         """Consume a stream of inputs and yield streaming results."""
+        if (not keep_order) and return_exceptions:
+            raise ValueError("return_exceptions=True requires keep_order=True.")
+
         config = ensure_config(config)
         # If receives is None, we just invoke once.
         if receives is None:
@@ -469,19 +521,16 @@ class Transable(ABC, Generic[Input, PhotoType]):
                     **kwargs,
                 )
             except Exception as e:
-                if not ignore_exceptions:
+                if not return_exceptions:
                     raise
-                else:
-                    raise ValueError(
-                        "Exceptions cannot be ignored when only one output can be generated."
-                    ) from e
+                yield e
             return
 
         send, recv = anyio.create_memory_object_stream[PhotoType](
             max_buffer_size=stream_buffer(config)
         )
         out_send, out_recv = anyio.create_memory_object_stream[
-            tuple[int, PhotoType | None]
+            tuple[int, PhotoType | Exception]
         ](max_buffer_size=stream_buffer(config))
 
         max_concurrency = config.get("max_concurrency")
@@ -510,10 +559,10 @@ class Transable(ABC, Generic[Input, PhotoType]):
                         child_config,
                         **kwargs,
                     )
-                except Exception:
-                    if not ignore_exceptions:
+                except Exception as e:
+                    if not return_exceptions:
                         raise
-                    await out_send.send((idx, None))
+                    await out_send.send((idx, e))
                 else:
                     await out_send.send((idx, result))
 
@@ -527,25 +576,22 @@ class Transable(ABC, Generic[Input, PhotoType]):
             finally:
                 await out_send.aclose()
 
-        async def _collect_outputs() -> AsyncIterator[PhotoType]:
+        async def _collect_outputs() -> AsyncIterator[PhotoType | Exception]:
             async with out_recv:
                 # don't keep order
                 if not keep_order:
-                    async for payload in out_recv:
-                        if payload[1] is None:
-                            continue
-                        yield cast("PhotoType", payload[1])
+                    async for _, out in out_recv:
+                        yield out
                     return
 
                 # keep order
                 cond = anyio.Condition()
-                pending: dict[int, PhotoType] = {}
+                pending: dict[int, PhotoType | Exception] = {}
                 done = False
 
                 async def _ingest() -> None:
                     nonlocal done
-                    async for payload in out_recv:
-                        i, v = cast("tuple[int, PhotoType]", payload)
+                    async for i, v in out_recv:
                         async with cond:
                             pending[i] = v
                             cond.notify_all()
@@ -564,8 +610,7 @@ class Transable(ABC, Generic[Input, PhotoType]):
                                 await cond.wait()
                             out = pending.pop(next_idx)
                             next_idx += 1
-                        if out is not None:
-                            yield out
+                        yield out
 
         async with anyio.create_task_group() as tg:
             tg.start_soon(_broadcast)
@@ -936,6 +981,8 @@ class Transable(ABC, Generic[Input, PhotoType]):
         receives: Any | None,
         config: TransableConfig | None,
         *,
+        keep_order: bool = False,
+        return_exceptions: bool = False,
         run_type: str | None = None,
         **kwargs: Any,
     ) -> Iterator[Output]:
@@ -946,6 +993,8 @@ class Transable(ABC, Generic[Input, PhotoType]):
             input,
             receives,
             config,
+            keep_order=keep_order,
+            return_exceptions=return_exceptions,
             run_type=run_type,
             **kwargs,
         )
@@ -963,6 +1012,8 @@ class Transable(ABC, Generic[Input, PhotoType]):
         receives: Any | None,
         config: TransableConfig | None,
         *,
+        keep_order: bool = False,
+        return_exceptions: bool = False,
         run_type: str | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[Output]:
@@ -973,6 +1024,8 @@ class Transable(ABC, Generic[Input, PhotoType]):
             input,
             receives,
             config,
+            keep_order=keep_order,
+            return_exceptions=return_exceptions,
             run_type=run_type,
             **kwargs,
         ):
@@ -1265,9 +1318,9 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         config: TransableConfig,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
-    ) -> Iterator[PhotoType]:
+    ) -> Iterator[PhotoType | Exception]:
         child_config = patch_config(config, child=True)
         upstream: Iterator[Any] = run_in_context(
             child_config,
@@ -1275,13 +1328,180 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
             input,
             receives,
             child_config,
-            keep_order=keep_order,
-            ignore_exceptions=ignore_exceptions,
+            keep_order=True,
+            return_exceptions=True,
             **kwargs,
         )
-        for transable in self.chains[1:]:
-            upstream = self._pipe_stream(transable, upstream, input, config, **kwargs)
-        yield from upstream
+        if return_exceptions:
+            failed: dict[int, Exception] = {}
+            remaining_idxs: list[int] = []
+            success_results: dict[int, PhotoType] = {}
+            success_pos = 0
+            next_idx = 0
+            total_count: int | None = None
+            upstream_done = False
+
+            def _gen(upstream_iter: Iterator[Any] = upstream) -> Iterator[Any]:
+                nonlocal remaining_idxs, total_count
+                idx = 0
+                for result in upstream_iter:
+                    remaining_idxs.append(idx)
+                    idx += 1
+                    yield result
+                total_count = idx
+
+            for transable in self.chains[1:]:
+                upstream, remaining_idxs = self._pipe_stream_with_exceptions(
+                    transable,
+                    _gen(),
+                    input,
+                    config,
+                    failed,
+                    remaining_idxs,
+                    **kwargs,
+                )
+
+            while True:
+                if total_count is not None and next_idx >= total_count:
+                    break
+                if next_idx in failed:
+                    yield failed[next_idx]
+                    next_idx += 1
+                    continue
+                if next_idx in success_results:
+                    yield success_results.pop(next_idx)
+                    next_idx += 1
+                    continue
+                if upstream_done:
+                    if total_count is None:
+                        total_count = next_idx
+                    if next_idx < total_count:
+                        raise RuntimeError(
+                            "Sequence stream did not return results for all inputs."
+                        )
+                    break
+                try:
+                    result = next(upstream)
+                except StopIteration:
+                    upstream_done = True
+                    if total_count is None:
+                        total_count = len(remaining_idxs) + len(failed)
+                    continue
+                if success_pos >= len(remaining_idxs):
+                    raise RuntimeError(
+                        "Sequence stream produced more results than expected."
+                    )
+                mapped_idx = remaining_idxs[success_pos]
+                success_pos += 1
+                if isinstance(result, Exception):
+                    failed[mapped_idx] = result
+                else:
+                    success_results[mapped_idx] = cast("PhotoType", result)
+        else:
+            for transable in self.chains[1:]:
+                upstream = self._pipe_stream(
+                    transable,
+                    upstream,
+                    input,
+                    config,
+                    keep_order=keep_order,
+                    **kwargs,
+                )
+            yield from upstream
+
+    def _pipe_stream_with_exceptions(
+        self,
+        downstream: Transable[Any, Any],
+        upstream: Iterator[Any],
+        input: Input,
+        config: TransableConfig,
+        failed: dict[int, Exception],
+        remaining_idxs: list[int],
+        **kwargs: Any,
+    ) -> tuple[Iterator[PhotoType | Exception], list[int]]:
+        ensured_config = ensure_config(config)
+        child_config = patch_config(ensured_config, child=True)
+
+        next_remaining: list[int] = []
+
+        def _gen() -> Iterator[Any]:
+            def _coerced() -> Iterator[Any]:
+                for idx, result in enumerate(upstream):
+                    original_idx = remaining_idxs[idx]
+                    if isinstance(result, Exception):
+                        failed[original_idx] = result
+                        continue
+                    next_remaining.append(original_idx)
+                    yield coerce_photo(result, downstream.PhotoType)
+
+            stream_iter = run_in_context(
+                child_config,
+                downstream.stream,
+                input,
+                _coerced(),
+                child_config,
+                keep_order=True,
+                return_exceptions=True,
+                **kwargs,
+            )
+            yield from stream_iter
+
+        return _gen(), next_remaining
+
+    def _pipe_stream(
+        self,
+        downstream: Transable[Any, Any],
+        upstream: Iterator[Any],
+        input: Input,
+        config: TransableConfig | None = None,
+        keep_order: bool = False,
+        **kwargs: Any,
+    ) -> Iterator[Any]:
+        ensured_config = ensure_config(config)
+        child_config = patch_config(ensured_config, child=True)
+
+        def _gen() -> Iterator[Any]:
+            def _coerced() -> Iterator[Any]:
+                for result in upstream:
+                    yield coerce_photo(result, downstream.PhotoType)
+
+            stream_iter = run_in_context(
+                child_config,
+                downstream.stream,
+                input,
+                _coerced(),
+                child_config,
+                keep_order=keep_order,
+                return_exceptions=False,
+                **kwargs,
+            )
+            yield from stream_iter
+
+        return _gen()
+
+    @overload
+    def stream(
+        self,
+        input: Input,
+        receives: Iterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: bool = False,
+        return_exceptions: Literal[False] = False,
+        **kwargs: Any,
+    ) -> Iterator[PhotoType]: ...
+
+    @overload
+    def stream(
+        self,
+        input: Input,
+        receives: Iterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: Literal[True],
+        return_exceptions: Literal[True],
+        **kwargs: Any,
+    ) -> Iterator[PhotoType | Exception]: ...
 
     @override
     def stream(
@@ -1291,9 +1511,12 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         config: TransableConfig | None = None,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
-    ) -> Iterator[PhotoType]:
+    ) -> Iterator[PhotoType | Exception]:
+        if (not keep_order) and return_exceptions:
+            raise ValueError("return_exceptions=True requires keep_order=True.")
+
         config = ensure_config(config)
 
         yield from self._stream_with_config(
@@ -1302,7 +1525,7 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
             receives,
             config,
             keep_order=keep_order,
-            ignore_exceptions=ignore_exceptions,
+            return_exceptions=return_exceptions,
             run_type="stream",
             **kwargs,
         )
@@ -1314,7 +1537,7 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         config: TransableConfig,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
     ) -> AsyncIterator[Any]:
         child_config = patch_config(config, child=True)
@@ -1325,15 +1548,112 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
             receives,
             child_config,
             keep_order=keep_order,
-            ignore_exceptions=ignore_exceptions,
+            return_exceptions=return_exceptions,  # type: ignore
             **kwargs,
         )
-        for transable in self.chains[1:]:
-            upstream = self._pipe_async_stream(
-                transable, upstream, input, config, **kwargs
-            )
-        async for result in upstream:
-            yield result
+        if return_exceptions:
+            failed: dict[int, Exception] = {}
+            remaining_idxs: list[int] = []
+            success_results: dict[int, PhotoType] = {}
+            success_pos = 0
+            next_idx = 0
+            total_count: int | None = None
+            upstream_done = False
+
+            async def _gen(
+                upstream_iter: AsyncIterator[Any] = upstream,
+            ) -> AsyncIterator[Any]:
+                nonlocal remaining_idxs, total_count
+                idx = 0
+                async for result in upstream_iter:
+                    remaining_idxs.append(idx)
+                    idx += 1
+                    yield result
+                total_count = idx
+
+            for transable in self.chains[1:]:
+                upstream, remaining_idxs = self._pipe_async_stream_with_exceptions(
+                    transable,
+                    _gen(),
+                    input,
+                    config,
+                    failed,
+                    remaining_idxs,
+                    **kwargs,
+                )
+
+            while True:
+                if total_count is not None and next_idx >= total_count:
+                    break
+                if next_idx in failed:
+                    yield failed[next_idx]
+                    next_idx += 1
+                    continue
+                if next_idx in success_results:
+                    yield success_results.pop(next_idx)
+                    next_idx += 1
+                    continue
+                if upstream_done:
+                    if total_count is None:
+                        total_count = next_idx
+                    if next_idx < total_count:
+                        raise RuntimeError(
+                            "Sequence stream did not return results for all inputs."
+                        )
+                    break
+                try:
+                    result = await anext(upstream)
+                except StopAsyncIteration:
+                    upstream_done = True
+                    if total_count is None:
+                        total_count = len(remaining_idxs) + len(failed)
+                    continue
+                if success_pos >= len(remaining_idxs):
+                    raise RuntimeError(
+                        "Sequence stream produced more results than expected."
+                    )
+                mapped_idx = remaining_idxs[success_pos]
+                success_pos += 1
+                if isinstance(result, Exception):
+                    failed[mapped_idx] = result
+                else:
+                    success_results[mapped_idx] = cast("PhotoType", result)
+        else:
+            for transable in self.chains[1:]:
+                upstream = self._pipe_async_stream(
+                    transable,
+                    upstream,
+                    input,
+                    config,
+                    keep_order=keep_order,
+                    **kwargs,
+                )
+            async for result in upstream:
+                yield result
+
+    @overload
+    def astream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: bool = False,
+        return_exceptions: Literal[False] = False,
+        **kwargs: Any,
+    ) -> AsyncIterator[PhotoType]: ...
+
+    @overload
+    def astream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: Literal[True],
+        return_exceptions: Literal[True],
+        **kwargs: Any,
+    ) -> AsyncIterator[PhotoType | Exception]: ...
 
     @override
     async def astream(
@@ -1343,9 +1663,12 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
         config: TransableConfig | None = None,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
-    ) -> AsyncIterator[PhotoType]:
+    ) -> AsyncIterator[PhotoType | Exception]:
+        if (not keep_order) and return_exceptions:
+            raise ValueError("return_exceptions=True requires keep_order=True.")
+
         config = ensure_config(config)
 
         async for result in self._astream_with_config(
@@ -1354,11 +1677,94 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
             receives,
             config,
             keep_order=keep_order,
-            ignore_exceptions=ignore_exceptions,
+            return_exceptions=return_exceptions,
             run_type="astream",
             **kwargs,
         ):
             yield cast("PhotoType", result)
+
+    def _pipe_async_stream_with_exceptions(
+        self,
+        downstream: Transable[Any, Any],
+        upstream: AsyncIterator[Any],
+        input: Input,
+        config: TransableConfig,
+        failed: dict[int, Exception],
+        remaining_idxs: list[int],
+        **kwargs: Any,
+    ) -> tuple[AsyncIterator[PhotoType | Exception], list[int]]:
+        ensured_config = ensure_config(config)
+        child_config = patch_config(ensured_config, child=True)
+
+        next_remaining: list[int] = []
+
+        async def _gen() -> AsyncIterator[Any]:
+            async def _coerced() -> AsyncIterator[Any]:
+                idx = 0
+                async for result in upstream:
+                    original_idx = remaining_idxs[idx]
+                    idx += 1
+                    if isinstance(result, Exception):
+                        failed[original_idx] = result
+                        continue
+                    next_remaining.append(original_idx)
+                    yield coerce_photo(result, downstream.PhotoType)
+
+            stream_iter = run_in_context(
+                child_config,
+                downstream.astream,
+                input,
+                _coerced(),
+                child_config,
+                keep_order=True,
+                return_exceptions=True,
+                **kwargs,
+            )
+            async for item in stream_iter:
+                yield item
+
+        return _gen(), next_remaining
+
+    def _pipe_async_stream(
+        self,
+        downstream: Transable[Any, Any],
+        upstream: AsyncIterator[Any],
+        input: Input,
+        config: TransableConfig | None = None,
+        keep_order: bool = False,
+        **kwargs: Any,
+    ) -> AsyncIterator[Any]:
+        ensured_config = ensure_config(config)
+        child_config = patch_config(ensured_config, child=True)
+
+        async def _gen() -> AsyncIterator[Any]:
+            send, recv = anyio.create_memory_object_stream[Any](
+                max_buffer_size=stream_buffer(ensured_config)
+            )
+
+            async def _produce() -> None:
+                try:
+                    async for result in upstream:
+                        await send.send(coerce_photo(result, downstream.PhotoType))
+                finally:
+                    await send.aclose()
+
+            async with anyio.create_task_group() as tg, recv:
+                tg.start_soon(_produce)
+                stream_iter = run_in_context(
+                    child_config,
+                    downstream.astream,
+                    input,
+                    recv,
+                    child_config,
+                    keep_order=keep_order,
+                    return_exceptions=False,
+                    **kwargs,
+                )
+                async for result in stream_iter:
+                    yield result
+
+        return _gen()
 
     def _batch(
         self,
@@ -1622,72 +2028,6 @@ class TransableSequence(TransableSerializable[Input, PhotoType]):
             self._ensure_input_compatibility(transable, sequence_input_type)
             previous = transable
 
-    def _pipe_stream(
-        self,
-        downstream: Transable[Any, Any],
-        upstream: Iterator[Any],
-        input: Input,
-        config: TransableConfig | None = None,
-        **kwargs: Any,
-    ) -> Iterator[Any]:
-        ensured_config = ensure_config(config)
-        child_config = patch_config(ensured_config, child=True)
-
-        def _gen() -> Iterator[Any]:
-            def _coerced() -> Iterator[Any]:
-                for result in upstream:
-                    yield coerce_photo(result, downstream.PhotoType)
-
-            stream_iter = run_in_context(
-                child_config,
-                downstream.stream,
-                input,
-                _coerced(),
-                child_config,
-                **kwargs,
-            )
-            yield from stream_iter
-
-        return _gen()
-
-    def _pipe_async_stream(
-        self,
-        downstream: Transable[Any, Any],
-        upstream: AsyncIterator[Any],
-        input: Input,
-        config: TransableConfig | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[Any]:
-        ensured_config = ensure_config(config)
-        child_config = patch_config(ensured_config, child=True)
-
-        async def _gen() -> AsyncIterator[Any]:
-            send, recv = anyio.create_memory_object_stream[Any](
-                max_buffer_size=stream_buffer(ensured_config)
-            )
-
-            async def _produce() -> None:
-                try:
-                    async for result in upstream:
-                        await send.send(coerce_photo(result, downstream.PhotoType))
-                finally:
-                    await send.aclose()
-
-            async with anyio.create_task_group() as tg, recv:
-                tg.start_soon(_produce)
-                stream_iter = run_in_context(
-                    child_config,
-                    downstream.astream,
-                    input,
-                    recv,
-                    child_config,
-                    **kwargs,
-                )
-                async for result in stream_iter:
-                    yield result
-
-        return _gen()
-
     def _ensure_input_compatibility(
         self,
         transable: Transable[Any, Any],
@@ -1890,9 +2230,9 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         config: TransableConfig,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
-    ) -> Iterator[PhotoType]:
+    ) -> Iterator[PhotoType | Exception]:
         if receives is None:
             raise ValueError(
                 "Parallel Transables require an input PhotoResult stream when streamed."
@@ -1901,7 +2241,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         buffer_size = stream_buffer(config)
         sentinel = object()
         cond = threading.Condition()
-        step_outputs: dict[str, list[PhotoType | None]] = defaultdict(
+        step_outputs: dict[str, list[PhotoType | Exception | None]] = defaultdict(
             lambda: [None] * len(self.steps)
         )
         base_items: dict[str, PhotoType] = {}
@@ -1913,6 +2253,10 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         arrived_count: dict[str, int] = {}
         ready_queue: deque[str] = deque()
         stop_event = threading.Event()
+        step_expected: list[deque[str]] | None = None
+
+        if return_exceptions:
+            step_expected = [deque() for _ in self.steps]
 
         base_queue: queue.Queue[object] | None = None
         if keep_order:
@@ -1921,6 +2265,23 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         child_queues: list[queue.Queue[object]] = [
             queue.Queue(maxsize=buffer_size) for _ in self.steps
         ]
+
+        def _merge_or_error(
+            base_item: PhotoType,
+            outputs: list[PhotoType | Exception],
+        ) -> PhotoType | Exception:
+            excs = [res for res in outputs if isinstance(res, Exception)]
+            if excs:
+                return (
+                    ExceptionGroup(
+                        "Errors occurred in parallel Transable steps for photo "
+                        f"{base_item.get_unique_id()}: {base_item}.",
+                        excs,
+                    )
+                    if len(excs) > 1
+                    else excs[0]
+                )
+            return merge_photos(base_item, cast("list[PhotoType]", outputs))
 
         def _queue_iter(q: queue.Queue[object]) -> Iterator[PhotoType]:
             while True:
@@ -1956,7 +2317,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                     unique_id = base_item.get_unique_id()
                     with cond:
                         if any(step_done):
-                            if not ignore_exceptions:
+                            if not return_exceptions:
                                 fatal_error = ValueError(
                                     "A parallel step finished early; cannot continue streaming."
                                 )
@@ -1967,6 +2328,9 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                         arrived_count[unique_id] = 0
                         if pending is not None:
                             pending.add(unique_id)
+                        if step_expected is not None:
+                            for expected in step_expected:
+                                expected.append(unique_id)
                         cond.notify_all()
                     if base_queue is not None:
                         _put_queue(base_queue, base_item)
@@ -1995,18 +2359,64 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                     _queue_iter(child_queues[idx]),
                     child_config,
                     keep_order=keep_order,
-                    ignore_exceptions=ignore_exceptions,
+                    return_exceptions=return_exceptions,  # pyright: ignore[reportArgumentType]
                     **kwargs,
                 )
                 for result in stream_iter:
-                    coerced = coerce_photo(result, self.PhotoType)
-                    unique_id = coerced.get_unique_id()
+                    expected_id: str | None = None
+                    if return_exceptions and step_expected is not None:
+                        with cond:
+                            if not step_expected[idx]:
+                                errors.append(
+                                    ValueError(
+                                        "Parallel step produced more results than expected."
+                                    )
+                                )
+                                cond.notify_all()
+                                stop_event.set()
+                                return
+                            expected_id = step_expected[idx].popleft()
+
+                    if isinstance(result, Exception):
+                        if not return_exceptions:
+                            raise result
+                        unique_id = expected_id
+                        payload: PhotoType | Exception = result
+                    else:
+                        coerced = coerce_photo(result, self.PhotoType)
+                        unique_id = coerced.get_unique_id()
+                        if expected_id is not None and unique_id != expected_id:
+                            errors.append(
+                                ValueError(
+                                    "Parallel step result order mismatch for unique ID "
+                                    f"{unique_id}; expected {expected_id}."
+                                )
+                            )
+                            unique_id = expected_id
+                        payload = clone_photo(coerced)
+
+                    if unique_id is None:
+                        errors.append(
+                            ValueError(
+                                "Parallel step produced results with no matching base item."
+                            )
+                        )
+                        stop_event.set()
+                        return
+
                     with cond:
                         if (
                             unique_id not in base_items
                             and unique_id not in step_outputs
                         ):
-                            if ignore_exceptions:
+                            if return_exceptions:
+                                errors.append(
+                                    ValueError(
+                                        "Parallel step produced results with no matching base item: "
+                                        f"{unique_id}"
+                                    )
+                                )
+                                cond.notify_all()
                                 continue
                             errors.append(
                                 ValueError(
@@ -2021,7 +2431,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                             arrived_count[unique_id] = (
                                 arrived_count.get(unique_id, 0) + 1
                             )
-                        outputs[idx] = clone_photo(coerced)
+                        outputs[idx] = payload
                         if (
                             pending is not None
                             and unique_id in pending
@@ -2030,7 +2440,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                             ready_queue.append(unique_id)
                         cond.notify_all()
             except Exception as exc:
-                if not ignore_exceptions:
+                if not return_exceptions:
                     with cond:
                         errors.append(exc)
                         cond.notify_all()
@@ -2043,7 +2453,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                             uid for uid in pending if step_outputs[uid][idx] is None
                         ]
                         if missing_ids:
-                            if ignore_exceptions:
+                            if return_exceptions:
                                 for unique_id in missing_ids:
                                     pending.remove(unique_id)
                                     base_items.pop(unique_id, None)
@@ -2058,7 +2468,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                                 )
                     cond.notify_all()
 
-        def _collect_ordered() -> Iterator[PhotoType]:
+        def _collect_ordered() -> Iterator[PhotoType | Exception]:
             assert base_queue is not None
             while True:
                 base_item = base_queue.get()
@@ -2066,11 +2476,12 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                     break
                 base_item = cast("PhotoType", base_item)
                 unique_id = base_item.get_unique_id()
+                merged: PhotoType | Exception | None = None
                 while True:
                     with cond:
                         if fatal_error is not None:
                             raise fatal_error
-                        if errors and not ignore_exceptions:
+                        if errors and not return_exceptions:
                             raise errors[0]
                         outputs = step_outputs[unique_id]
                         missing = [
@@ -2079,18 +2490,44 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                         if not missing:
                             step_outputs.pop(unique_id, None)
                             base_items.pop(unique_id, None)
-                            merged = merge_photos(
-                                base_item,
-                                cast("list[PhotoType]", list(outputs)),
-                            )
                             arrived_count.pop(unique_id, None)
+                            if return_exceptions:
+                                merged = _merge_or_error(
+                                    base_item,
+                                    cast(
+                                        "list[PhotoType | Exception]",
+                                        list(outputs),
+                                    ),
+                                )
+                            else:
+                                merged = merge_photos(
+                                    base_item,
+                                    cast("list[PhotoType]", list(outputs)),
+                                )
                             break
                         if any(step_done[idx] for idx in missing):
                             step_outputs.pop(unique_id, None)
                             base_items.pop(unique_id, None)
                             arrived_count.pop(unique_id, None)
-                            if ignore_exceptions:
-                                merged = None
+                            if return_exceptions:
+                                excs = [
+                                    res for res in outputs if isinstance(res, Exception)
+                                ]
+                                if excs:
+                                    merged = (
+                                        ExceptionGroup(
+                                            "Errors occurred in parallel Transable steps for photo "
+                                            f"{unique_id}: {base_item}.",
+                                            excs,
+                                        )
+                                        if len(excs) > 1
+                                        else excs[0]
+                                    )
+                                else:
+                                    merged = ValueError(
+                                        "Parallel step results missing for unique ID "
+                                        f"{unique_id}."
+                                    )
                                 break
                             raise ValueError(
                                 "Parallel step results missing for unique ID "
@@ -2103,21 +2540,21 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
             with cond:
                 if fatal_error is not None:
                     raise fatal_error
-                if errors and not ignore_exceptions:
+                if errors and not return_exceptions:
                     raise errors[0]
-                if step_outputs and not ignore_exceptions:
+                if step_outputs and not return_exceptions:
                     raise ValueError(
                         "Parallel step produced results with no matching base item: "
                         f"{', '.join(step_outputs.keys())}"
                     )
 
-        def _collect_unordered() -> Iterator[PhotoType]:
+        def _collect_unordered() -> Iterator[PhotoType | Exception]:
             assert pending is not None
             while True:
                 with cond:
                     if fatal_error is not None:
                         raise fatal_error
-                    if errors and not ignore_exceptions:
+                    if errors and not return_exceptions:
                         raise errors[0]
                     while not ready_queue:
                         if base_done and not pending:
@@ -2125,7 +2562,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                         cond.wait()
                         if fatal_error is not None:
                             raise fatal_error
-                        if errors and not ignore_exceptions:
+                        if errors and not return_exceptions:
                             raise errors[0]
                     if base_done and not pending and not ready_queue:
                         break
@@ -2137,15 +2574,18 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                     pending.remove(unique_id)
                     arrived_count.pop(unique_id, None)
                 if outputs is not None:
-                    outs = cast("list[PhotoType]", list(outputs))
-                    yield merge_photos(base_item, outs)
+                    outs = cast("list[PhotoType | Exception]", list(outputs))
+                    if return_exceptions:
+                        yield _merge_or_error(base_item, outs)
+                    else:
+                        yield merge_photos(base_item, cast("list[PhotoType]", outs))
 
             with cond:
                 if fatal_error is not None:
                     raise fatal_error
-                if errors and not ignore_exceptions:
+                if errors and not return_exceptions:
                     raise errors[0]
-                if step_outputs and not ignore_exceptions:
+                if step_outputs and not return_exceptions:
                     raise ValueError(
                         "Parallel step produced results with no matching base item: "
                         f"{', '.join(step_outputs.keys())}"
@@ -2171,6 +2611,30 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                     _put_queue(q, sentinel)
                 wait(futures)
 
+    @overload
+    def stream(
+        self,
+        input: Input,
+        receives: Iterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: bool = False,
+        return_exceptions: Literal[False] = False,
+        **kwargs: Any,
+    ) -> Iterator[PhotoType]: ...
+
+    @overload
+    def stream(
+        self,
+        input: Input,
+        receives: Iterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: Literal[True],
+        return_exceptions: Literal[True],
+        **kwargs: Any,
+    ) -> Iterator[PhotoType | Exception]: ...
+
     @override
     def stream(
         self,
@@ -2179,9 +2643,12 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         config: TransableConfig | None = None,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
-    ) -> Iterator[PhotoType]:
+    ) -> Iterator[PhotoType | Exception]:
+        if (not keep_order) and return_exceptions:
+            raise ValueError("return_exceptions=True requires keep_order=True.")
+
         config = ensure_config(config)
 
         yield from self._stream_with_config(
@@ -2190,7 +2657,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
             receives,
             config,
             keep_order=keep_order,
-            ignore_exceptions=ignore_exceptions,
+            return_exceptions=return_exceptions,
             run_type="parallel_stream",
             **kwargs,
         )
@@ -2202,9 +2669,9 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         config: TransableConfig,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
-    ) -> AsyncIterator[PhotoType]:
+    ) -> AsyncIterator[PhotoType | Exception]:
         if receives is None:
             raise ValueError(
                 "Parallel Transables require an input PhotoResult stream when streamed."
@@ -2214,12 +2681,16 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         base_items: dict[str, PhotoType] = {}
         pending: set[str] | None = set() if not keep_order else None
         base_done = False
-        step_outputs: dict[str, list[PhotoType | None]] = defaultdict(
+        step_outputs: dict[str, list[PhotoType | Exception | None]] = defaultdict(
             lambda: [None] * len(self.steps)
         )
 
         arrived_count: dict[str, int] = {}
         ready_queue: deque[str] = deque()
+
+        step_expected: list[deque[str]] | None = None
+        if return_exceptions:
+            step_expected = [deque() for _ in self.steps]
 
         base_send: ObjectSendStream[PhotoType] | None = None
         base_recv: ObjectReceiveStream[PhotoType] | None = None
@@ -2240,6 +2711,23 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         output_cond: anyio.Condition = anyio.Condition()
         step_done: list[bool] = [False] * len(self.steps)
 
+        def _merge_or_error(
+            base_item: PhotoType,
+            outputs: list[PhotoType | Exception],
+        ) -> PhotoType | Exception:
+            excs = [res for res in outputs if isinstance(res, Exception)]
+            if excs:
+                return (
+                    ExceptionGroup(
+                        "Errors occurred in parallel Transable steps for photo "
+                        f"{base_item.get_unique_id()}: {base_item}.",
+                        excs,
+                    )
+                    if len(excs) > 1
+                    else excs[0]
+                )
+            return merge_photos(base_item, cast("list[PhotoType]", outputs))
+
         async def _broadcast() -> None:
             nonlocal base_done
             active_child_sends: list[ObjectSendStream[PhotoType]] = list(child_sends)
@@ -2250,7 +2738,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                     unique_id = base_item.get_unique_id()
                     async with output_cond:
                         if any(step_done):
-                            if not ignore_exceptions:
+                            if not return_exceptions:
                                 raise ValueError(
                                     "A parallel step finished early; cannot continue streaming."
                                 )
@@ -2259,6 +2747,9 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                         arrived_count[unique_id] = 0
                         if pending is not None:
                             pending.add(unique_id)
+                        if step_expected is not None:
+                            for expected in step_expected:
+                                expected.append(unique_id)
                         output_cond.notify_all()
                     if base_send is not None:
                         await base_send.send(base_item)
@@ -2268,7 +2759,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                         try:
                             await send.send(clone_photo(coerced))
                         except (BrokenResourceError, ClosedResourceError):
-                            if not ignore_exceptions:
+                            if not return_exceptions:
                                 raise
                             to_remove.append(send)
                     if to_remove:
@@ -2295,18 +2786,45 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                         child_recvs[idx],
                         child_config,
                         keep_order=keep_order,
-                        ignore_exceptions=ignore_exceptions,
+                        return_exceptions=return_exceptions,  # pyright: ignore[reportArgumentType]
                         **kwargs,
                     )
                     async for result in stream_iter:
-                        coerced = coerce_photo(result, self.PhotoType)
-                        unique_id = coerced.get_unique_id()
+                        expected_id: str | None = None
+                        if return_exceptions and step_expected is not None:
+                            async with output_cond:
+                                if not step_expected[idx]:
+                                    raise ValueError(
+                                        "Parallel step produced more results than expected."
+                                    )
+                                expected_id = step_expected[idx].popleft()
+
+                        if isinstance(result, Exception):
+                            if not return_exceptions:
+                                raise result
+                            unique_id = expected_id
+                            payload: PhotoType | Exception = result
+                        else:
+                            coerced = coerce_photo(result, self.PhotoType)
+                            unique_id = coerced.get_unique_id()
+                            if expected_id is not None and unique_id != expected_id:
+                                raise ValueError(
+                                    "Parallel step result order mismatch for unique ID "
+                                    f"{unique_id}; expected {expected_id}."
+                                )
+                            payload = clone_photo(coerced)
+
+                        if unique_id is None:
+                            raise ValueError(
+                                "Parallel step produced results with no matching base item."
+                            )
+
                         async with output_cond:
                             if (
                                 unique_id not in base_items
                                 and unique_id not in step_outputs
                             ):
-                                if ignore_exceptions:
+                                if return_exceptions:
                                     continue
                                 raise ValueError(
                                     "Parallel step produced results with no matching base item: "
@@ -2317,7 +2835,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                                 arrived_count[unique_id] = (
                                     arrived_count.get(unique_id, 0) + 1
                                 )
-                            outputs[idx] = clone_photo(coerced)
+                            outputs[idx] = payload
                             if (
                                 pending is not None
                                 and unique_id in pending
@@ -2326,7 +2844,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                                 ready_queue.append(unique_id)
                             output_cond.notify_all()
             except Exception:
-                if not ignore_exceptions:
+                if not return_exceptions:
                     raise
             finally:
                 async with output_cond:
@@ -2337,7 +2855,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                             uid for uid in pending if step_outputs[uid][idx] is None
                         ]
                         if missing_ids:
-                            if ignore_exceptions:
+                            if return_exceptions:
                                 for unique_id in missing_ids:
                                     pending.remove(unique_id)
                                     base_items.pop(unique_id, None)
@@ -2351,11 +2869,12 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
 
                     output_cond.notify_all()
 
-        async def _collect_outputs_ordered() -> AsyncIterator[PhotoType]:
+        async def _collect_outputs_ordered() -> AsyncIterator[PhotoType | Exception]:
             assert base_recv is not None
             async with base_recv:
                 async for base_item in base_recv:
                     unique_id = base_item.get_unique_id()
+                    merged: PhotoType | Exception | None = None
 
                     while True:
                         async with output_cond:
@@ -2364,33 +2883,64 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                                 i for i, res in enumerate(outputs) if res is None
                             ]
                             if not missing:
-                                outs = cast("list[PhotoType]", list(outputs))
                                 step_outputs.pop(unique_id, None)
                                 base_items.pop(unique_id, None)
                                 arrived_count.pop(unique_id, None)
+                                if return_exceptions:
+                                    merged = _merge_or_error(
+                                        base_item,
+                                        cast(
+                                            "list[PhotoType | Exception]",
+                                            list(outputs),
+                                        ),
+                                    )
+                                else:
+                                    merged = merge_photos(
+                                        base_item,
+                                        cast("list[PhotoType]", list(outputs)),
+                                    )
                                 break
                             if any(step_done[i] for i in missing):
                                 step_outputs.pop(unique_id, None)
                                 base_items.pop(unique_id, None)
                                 arrived_count.pop(unique_id, None)
-                                if ignore_exceptions:
-                                    outs = None
+                                if return_exceptions:
+                                    excs = [
+                                        res
+                                        for res in outputs
+                                        if isinstance(res, Exception)
+                                    ]
+                                    if excs:
+                                        merged = (
+                                            ExceptionGroup(
+                                                "Errors occurred in parallel Transable steps for photo "
+                                                f"{unique_id}: {base_item}.",
+                                                excs,
+                                            )
+                                            if len(excs) > 1
+                                            else excs[0]
+                                        )
+                                    else:
+                                        merged = ValueError(
+                                            "Parallel step results missing for unique ID "
+                                            f"{unique_id}."
+                                        )
                                     break
                                 raise ValueError(
                                     "Parallel step results missing for unique ID "
                                     f"{unique_id}."
                                 )
                             await output_cond.wait()
-                    if outs is not None:
-                        yield merge_photos(base_item, outs)
+                    if merged is not None:
+                        yield merged
                 async with output_cond:
-                    if step_outputs and not ignore_exceptions:
+                    if step_outputs and not return_exceptions:
                         raise ValueError(
                             "Parallel step produced results with no matching base item: "
                             f"{', '.join(step_outputs.keys())}"
                         )
 
-        async def _collect_outputs_unordered() -> AsyncIterator[PhotoType]:
+        async def _collect_outputs_unordered() -> AsyncIterator[PhotoType | Exception]:
             assert pending is not None
             while True:
                 async with output_cond:
@@ -2408,11 +2958,14 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                     pending.remove(uid)
                     arrived_count.pop(uid, None)
                 if outputs is not None:
-                    outs = cast("list[PhotoType]", list(outputs))
-                    yield merge_photos(base_item, outs)
+                    outs = cast("list[PhotoType | Exception]", list(outputs))
+                    if return_exceptions:
+                        yield _merge_or_error(base_item, outs)
+                    else:
+                        yield merge_photos(base_item, cast("list[PhotoType]", outs))
 
             async with output_cond:
-                if step_outputs and not ignore_exceptions:
+                if step_outputs and not return_exceptions:
                     raise ValueError(
                         "Parallel step produced results with no matching base item: "
                         f"{', '.join(step_outputs.keys())}"
@@ -2429,6 +2982,30 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
                 async for output in _collect_outputs_unordered():
                     yield output
 
+    @overload
+    def astream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: bool = False,
+        return_exceptions: Literal[False] = False,
+        **kwargs: Any,
+    ) -> AsyncIterator[PhotoType]: ...
+
+    @overload
+    def astream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: Literal[True],
+        return_exceptions: Literal[True],
+        **kwargs: Any,
+    ) -> AsyncIterator[PhotoType | Exception]: ...
+
     @override
     async def astream(
         self,
@@ -2437,9 +3014,12 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
         config: TransableConfig | None = None,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
-    ) -> AsyncIterator[PhotoType]:
+    ) -> AsyncIterator[PhotoType | Exception]:
+        if (not keep_order) and return_exceptions:
+            raise ValueError("return_exceptions=True requires keep_order=True.")
+
         config = ensure_config(config)
 
         async for result in self._astream_with_config(
@@ -2448,7 +3028,7 @@ class TransableParallel(TransableSerializable[Input, PhotoType]):
             receives,
             config,
             keep_order=keep_order,
-            ignore_exceptions=ignore_exceptions,
+            return_exceptions=return_exceptions,
             run_type="parallel_astream",
             **kwargs,
         ):
@@ -3266,18 +3846,21 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         config: TransableConfig,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
-    ) -> Iterator[PhotoType]:
+    ) -> Iterator[PhotoType | Exception]:
         if not hasattr(self, "stream_func"):
             child_config = patch_config(config, trace=False, child=True)
+            # Pass data separately to avoid mypy confusion with **kwargs
+            data = {
+                "keep_order": keep_order,
+                "return_exceptions": return_exceptions,
+            }
             yield from super().stream(
                 input,
                 receives,
                 child_config,
-                keep_order=keep_order,
-                ignore_exceptions=ignore_exceptions,
-                **kwargs,
+                **{**data, **kwargs},
             )
             return
 
@@ -3305,6 +3888,30 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         else:
             raise TypeError("stream_func must be a generator.")
 
+    @overload
+    def stream(
+        self,
+        input: Input,
+        receives: Iterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: bool = False,
+        return_exceptions: Literal[False] = False,
+        **kwargs: Any,
+    ) -> Iterator[PhotoType]: ...
+
+    @overload
+    def stream(
+        self,
+        input: Input,
+        receives: Iterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: Literal[True],
+        return_exceptions: Literal[True],
+        **kwargs: Any,
+    ) -> Iterator[PhotoType | Exception]: ...
+
     @override
     def stream(
         self,
@@ -3313,9 +3920,12 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         config: TransableConfig | None = None,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
-    ) -> Iterator[PhotoType]:
+    ) -> Iterator[PhotoType | Exception]:
+        if (not keep_order) and return_exceptions:
+            raise ValueError("return_exceptions=True requires keep_order=True.")
+
         config = ensure_config(config)
 
         yield from self._stream_with_config(
@@ -3324,7 +3934,7 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
             receives,
             config,
             keep_order=keep_order,
-            ignore_exceptions=ignore_exceptions,
+            return_exceptions=return_exceptions,
             run_type="stream",
             **kwargs,
         )
@@ -3336,9 +3946,9 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         config: TransableConfig,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
-    ) -> AsyncIterator[PhotoType]:
+    ) -> AsyncIterator[PhotoType | Exception]:
         stream_func: Callable[..., Any] | None = None
         if hasattr(self, "astream_func"):
             stream_func = self.astream_func
@@ -3347,13 +3957,16 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
 
         if stream_func is None:
             child_config = patch_config(config, trace=False, child=True)
+            # Pass data separately to avoid mypy confusion with **kwargs
+            data = {
+                "keep_order": keep_order,
+                "return_exceptions": return_exceptions,
+            }
             async for item in super().astream(
                 input,
                 receives,
                 child_config,
-                keep_order=keep_order,
-                ignore_exceptions=ignore_exceptions,
-                **kwargs,
+                **{**data, **kwargs},
             ):
                 yield item
             return
@@ -3469,6 +4082,30 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
                         continue
                     yield coerce_photo(cast("PhotoType", payload), self.PhotoType)
 
+    @overload
+    def astream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: bool = False,
+        return_exceptions: Literal[False] = False,
+        **kwargs: Any,
+    ) -> AsyncIterator[PhotoType]: ...
+
+    @overload
+    def astream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: Literal[True],
+        return_exceptions: Literal[True],
+        **kwargs: Any,
+    ) -> AsyncIterator[PhotoType | Exception]: ...
+
     @override
     async def astream(
         self,
@@ -3477,9 +4114,12 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
         config: TransableConfig | None = None,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
-    ) -> AsyncIterator[PhotoType]:
+    ) -> AsyncIterator[PhotoType | Exception]:
+        if (not keep_order) and return_exceptions:
+            raise ValueError("return_exceptions=True requires keep_order=True.")
+
         config = ensure_config(config)
 
         async for item in self._astream_with_config(
@@ -3488,7 +4128,7 @@ class TransableLambda(Transable[Input, PhotoType]):  # noqa: PLW1641
             receives,
             config,
             keep_order=keep_order,
-            ignore_exceptions=ignore_exceptions,
+            return_exceptions=return_exceptions,
             run_type="astream",
             **kwargs,
         ):
@@ -3618,6 +4258,30 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
             **{**self.kwargs, **kwargs},
         )
 
+    @overload
+    def stream(
+        self,
+        input: Input,
+        receives: Iterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: bool = False,
+        return_exceptions: Literal[False] = False,
+        **kwargs: Any,
+    ) -> Iterator[PhotoType]: ...
+
+    @overload
+    def stream(
+        self,
+        input: Input,
+        receives: Iterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: Literal[True],
+        return_exceptions: Literal[True],
+        **kwargs: Any,
+    ) -> Iterator[PhotoType | Exception]: ...
+
     @override
     def stream(
         self,
@@ -3626,19 +4290,49 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         config: TransableConfig | None = None,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
-    ) -> Iterator[PhotoType]:
+    ) -> Iterator[PhotoType | Exception]:
+        if (not keep_order) and return_exceptions:
+            raise ValueError("return_exceptions=True requires keep_order=True.")
+
         merged_config = self._merge_configs(config)
 
+        # Pass data separately to avoid mypy confusion with **kwargs
+        data = {
+            "keep_order": keep_order,
+            "return_exceptions": return_exceptions,
+        }
         yield from self.bound.stream(
             input,
             receives,
             merged_config,
-            keep_order=keep_order,
-            ignore_exceptions=ignore_exceptions,
-            **{**self.kwargs, **kwargs},
+            **{**data, **self.kwargs, **kwargs},
         )
+
+    @overload
+    def astream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: bool = False,
+        return_exceptions: Literal[False] = False,
+        **kwargs: Any,
+    ) -> AsyncIterator[PhotoType]: ...
+
+    @overload
+    def astream(
+        self,
+        input: Input,
+        receives: AsyncIterator[PhotoType] | None = None,
+        config: TransableConfig | None = None,
+        *,
+        keep_order: Literal[True],
+        return_exceptions: Literal[True],
+        **kwargs: Any,
+    ) -> AsyncIterator[PhotoType | Exception]: ...
 
     @override
     async def astream(
@@ -3648,18 +4342,24 @@ class TransableBinding(TransableSerializable[Input, PhotoType]):
         config: TransableConfig | None = None,
         *,
         keep_order: bool = False,
-        ignore_exceptions: bool = False,
+        return_exceptions: bool = False,
         **kwargs: Any,
-    ) -> AsyncIterator[PhotoType]:
+    ) -> AsyncIterator[PhotoType | Exception]:
+        if (not keep_order) and return_exceptions:
+            raise ValueError("return_exceptions=True requires keep_order=True.")
+
         merged_config = self._merge_configs(config)
 
+        # Pass data separately to avoid mypy confusion with **kwargs
+        data = {
+            "keep_order": keep_order,
+            "return_exceptions": return_exceptions,
+        }
         async for item in self.bound.astream(
             input,
             receives,
             merged_config,
-            keep_order=keep_order,
-            ignore_exceptions=ignore_exceptions,
-            **{**self.kwargs, **kwargs},
+            **{**data, **self.kwargs, **kwargs},
         ):
             yield item
 

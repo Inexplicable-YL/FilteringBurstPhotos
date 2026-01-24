@@ -290,7 +290,7 @@ def iter_with_tracing(
     config: TransableConfig,
     *,
     keep_order: bool = False,
-    ignore_exceptions: bool = False,
+    return_exceptions: bool = False,
     run_type: str | None = None,
     **kwargs: Any,
 ) -> Iterator[Output]:
@@ -304,7 +304,7 @@ def iter_with_tracing(
                 receive_value,
                 config,
                 keep_order=keep_order,
-                ignore_exceptions=ignore_exceptions,
+                return_exceptions=return_exceptions,
                 **kwargs,
             )
             for item in iterator:
@@ -324,7 +324,7 @@ def iter_with_tracing(
                 receive_value,
                 config,
                 keep_order=keep_order,
-                ignore_exceptions=ignore_exceptions,
+                return_exceptions=return_exceptions,
                 **kwargs,
             )
             for item in iterator:
@@ -356,7 +356,7 @@ async def aiter_with_tracing(
     config: TransableConfig,
     *,
     keep_order: bool = False,
-    ignore_exceptions: bool = False,
+    return_exceptions: bool = False,
     run_type: str | None = None,
     **kwargs: Any,
 ) -> AsyncIterator[Output]:
@@ -370,7 +370,7 @@ async def aiter_with_tracing(
                 receive_value,
                 config,
                 keep_order=keep_order,
-                ignore_exceptions=ignore_exceptions,
+                return_exceptions=return_exceptions,
                 **kwargs,
             )
             while True:
@@ -394,7 +394,7 @@ async def aiter_with_tracing(
                 receive_value,
                 config,
                 keep_order=keep_order,
-                ignore_exceptions=ignore_exceptions,
+                return_exceptions=return_exceptions,
                 **kwargs,
             )
             while True:
